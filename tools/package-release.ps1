@@ -1,12 +1,13 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$BenchmarkPath,
-    [string]$ExecutablePath
+    [string]$ExecutablePath,
+    [switch]$PerformanceRetested
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$version = '0.1.2'
+$version = '0.1.3'
 $dist = Join-Path $root 'dist'
 $packageName = "ExMonitorViewer-v$version-windows-x64"
 $staging = Join-Path $dist $packageName
@@ -44,18 +45,22 @@ New-Item -ItemType Directory -Path $stagingFullPath | Out-Null
 Copy-Item -LiteralPath $executableSource -Destination (Join-Path $stagingFullPath 'exmonitor-viewer.exe')
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $stagingFullPath
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stagingFullPath
-Copy-Item -LiteralPath (Join-Path $root 'docs\release-notes-v0.1.2.md') -Destination (Join-Path $stagingFullPath 'RELEASE-NOTES.md')
+Copy-Item -LiteralPath (Join-Path $root 'docs\release-notes-v0.1.3.md') -Destination (Join-Path $stagingFullPath 'RELEASE-NOTES.md')
 $benchmarkContents = Get-Content -Raw -LiteralPath $benchmarkSource
-$benchmarkHeader = "measurement_version=0.1.1`r`ncurrent_release=0.1.2`r`nperformance_retested=false`r`n"
+$measurementVersion = if ($PerformanceRetested) { $version } else { '0.1.1' }
+$performanceRetestedValue = if ($PerformanceRetested) { 'true' } else { 'false' }
+$benchmarkHeader = "measurement_version=$measurementVersion`r`ncurrent_release=$version`r`nperformance_retested=$performanceRetestedValue`r`n"
 [System.IO.File]::WriteAllText(
     (Join-Path $stagingFullPath 'BENCHMARK.txt'),
     $benchmarkHeader + $benchmarkContents,
     [System.Text.Encoding]::ASCII
 )
-Set-Content -Encoding utf8 -LiteralPath (Join-Path $stagingFullPath 'BENCHMARK-NOTE.txt') -Value @(
-    'BENCHMARK.txtはExMonitorViewer v0.1.1の参考測定値です。'
-    'v0.1.2では性能を再測定していません。設定の保存と再起動後の復元も手動確認していません。'
-)
+$benchmarkNote = if ($PerformanceRetested) {
+    @('BENCHMARK.txt contains a v0.1.3 ExMonitorViewer measurement.')
+} else {
+    @('BENCHMARK.txt contains reference measurements from ExMonitorViewer v0.1.1.')
+}
+Set-Content -Encoding utf8 -LiteralPath (Join-Path $stagingFullPath 'BENCHMARK-NOTE.txt') -Value $benchmarkNote
 
 $checksums = Get-ChildItem -LiteralPath $stagingFullPath -File |
     Sort-Object Name |

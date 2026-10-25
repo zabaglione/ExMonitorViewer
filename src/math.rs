@@ -36,6 +36,33 @@ pub fn fit_rect(
     }
 }
 
+pub fn fit_client_size(
+    source_width: u32,
+    source_height: u32,
+    available_width: u32,
+    available_height: u32,
+) -> (u32, u32) {
+    if source_width == 0 || source_height == 0 || available_width == 0 || available_height == 0 {
+        return (0, 0);
+    }
+    let scale = (available_width as f64 / source_width as f64)
+        .min(available_height as f64 / source_height as f64);
+    (
+        ((source_width as f64 * scale).round() as u32).max(1),
+        ((source_height as f64 * scale).round() as u32).max(1),
+    )
+}
+
+pub fn scale_client_size(source_width: u32, source_height: u32, percent: u32) -> (u32, u32) {
+    if source_width == 0 || source_height == 0 || percent == 0 {
+        return (0, 0);
+    }
+    (
+        ((source_width as u64 * percent as u64 + 50) / 100).max(1) as u32,
+        ((source_height as u64 * percent as u64 + 50) / 100).max(1) as u32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +104,19 @@ mod tests {
                 height: 0.0,
             }
         );
+    }
+
+    #[test]
+    fn fit_client_size_preserves_aspect_ratio_and_fills_available_bounds() {
+        assert_eq!(fit_client_size(1920, 1080, 1000, 700), (1000, 563));
+        assert_eq!(fit_client_size(1080, 1920, 900, 1000), (563, 1000));
+        assert_eq!(fit_client_size(1920, 1080, 0, 1000), (0, 0));
+    }
+
+    #[test]
+    fn scale_client_size_uses_source_pixels_as_one_hundred_percent() {
+        assert_eq!(scale_client_size(1920, 1080, 100), (1920, 1080));
+        assert_eq!(scale_client_size(1920, 1080, 25), (480, 270));
+        assert_eq!(scale_client_size(640, 480, 25), (160, 120));
     }
 }

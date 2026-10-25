@@ -17,7 +17,8 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -27,8 +28,11 @@ use windows_core::Interface;
 
 static APP_HWND: AtomicIsize = AtomicIsize::new(0);
 static MONITOR_MENU_HANDLE: AtomicIsize = AtomicIsize::new(0);
+static SCALE_MENU_HANDLE: AtomicIsize = AtomicIsize::new(0);
 static RESIZE_WIDTH: AtomicU32 = AtomicU32::new(960);
 static RESIZE_HEIGHT: AtomicU32 = AtomicU32::new(540);
+static SOURCE_WIDTH: AtomicU32 = AtomicU32::new(0);
+static SOURCE_HEIGHT: AtomicU32 = AtomicU32::new(0);
 static CURRENT_MONITOR: AtomicU32 = AtomicU32::new(0);
 static FPS_LIMIT: AtomicU32 = AtomicU32::new(60);
 static TOPMOST: AtomicBool = AtomicBool::new(false);
@@ -41,6 +45,10 @@ static WINDOW_MINIMIZED: AtomicBool = AtomicBool::new(false);
 static WINDOW_MAXIMIZED: AtomicBool = AtomicBool::new(false);
 static SETTINGS_TRACKING: AtomicBool = AtomicBool::new(false);
 static SETTINGS_DIRTY: AtomicBool = AtomicBool::new(false);
+static ACTIVE_SCALE: AtomicU32 = AtomicU32::new(0);
+static LAST_SIZE_MODE: AtomicU32 = AtomicU32::new(0);
+static ACTUAL_SCALE: AtomicU32 = AtomicU32::new(0);
+static WINDOW_CLOSE_LOGGED: AtomicBool = AtomicBool::new(false);
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static QUIT: AtomicBool = AtomicBool::new(false);
 
@@ -49,6 +57,10 @@ const FPS_MENU_30: usize = 9001;
 const FPS_MENU_60: usize = 9002;
 const FPS_MENU_MAX: usize = 9003;
 const TOPMOST_MENU: usize = 9004;
+const FIT_WINDOW_MENU: usize = 9010;
+const SCALE_MENU_BASE: usize = 9020;
+const SCALE_MENU_END: usize = SCALE_MENU_BASE + 6;
+const SCALE_PRESETS: [u32; 7] = [25, 50, 75, 100, 125, 150, 200];
 const DXGI_STATUS_OCCLUDED_CODE: HRESULT = HRESULT(0x087A0001u32 as i32);
 const SYNTHETIC_CURSOR_WIDTH: u32 = 16;
 const SYNTHETIC_CURSOR_HEIGHT: u32 = 24;
@@ -355,9 +367,27 @@ pub fn run() -> windows::core::Result<()> {
         AppendMenuW(fps_menu, MF_STRING, FPS_MENU_30, w!("30 FPS"))?;
         AppendMenuW(fps_menu, MF_STRING, FPS_MENU_60, w!("60 FPS"))?;
         AppendMenuW(fps_menu, MF_STRING, FPS_MENU_MAX, w!("Unlimited"))?;
+        let scale_menu = CreatePopupMenu()?;
+        SCALE_MENU_HANDLE.store(scale_menu.0 as isize, Ordering::Relaxed);
+        for (index, percent) in SCALE_PRESETS.iter().enumerate() {
+            let label = wide(&format!("{percent}%"));
+            AppendMenuW(
+                scale_menu,
+                MF_STRING,
+                SCALE_MENU_BASE + index,
+                PCWSTR(label.as_ptr()),
+            )?;
+        }
         let menu = CreateMenu()?;
         AppendMenuW(menu, MF_POPUP, monitor_menu.0 as usize, w!("Monitor"))?;
         AppendMenuW(menu, MF_POPUP, fps_menu.0 as usize, w!("FPS"))?;
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            FIT_WINDOW_MENU,
+            w!("Fit window to image\tF"),
+        )?;
+        AppendMenuW(menu, MF_POPUP, scale_menu.0 as usize, w!("Scale"))?;
         AppendMenuW(menu, MF_STRING, TOPMOST_MENU, w!("Always on top"))?;
         let _ = CheckMenuRadioItem(
             fps_menu,
@@ -480,7 +510,15 @@ pub fn run() -> windows::core::Result<()> {
         );
 
         let mut renderer = Renderer::new(&displays[current], hwnd, benchmark_cursor)?;
+        let (source_width, source_height) = renderer.logical_source_size();
+        SOURCE_WIDTH.store(source_width, Ordering::Relaxed);
+        SOURCE_HEIGHT.store(source_height, Ordering::Relaxed);
+        update_scale_selection(
+            RESIZE_WIDTH.load(Ordering::Relaxed),
+            RESIZE_HEIGHT.load(Ordering::Relaxed),
+        );
         SETTINGS_TRACKING.store(true, Ordering::Relaxed);
+        log_window_state(hwnd, "startup");
         log("GPU capture renderer initialized");
         let mut message = MSG::default();
         let initial_limit = FPS_LIMIT.load(Ordering::Relaxed);
@@ -532,6 +570,15 @@ pub fn run() -> windows::core::Result<()> {
                 let next = refreshed.get(next_index).ok_or_else(Error::from_win32)?;
                 CURRENT_MONITOR.store(next_index as u32, Ordering::Relaxed);
                 renderer = Renderer::new(next, hwnd, benchmark_cursor)?;
+                let (source_width, source_height) = renderer.logical_source_size();
+                SOURCE_WIDTH.store(source_width, Ordering::Relaxed);
+                SOURCE_HEIGHT.store(source_height, Ordering::Relaxed);
+                LAST_SIZE_MODE.store(0, Ordering::Relaxed);
+                ACTUAL_SCALE.store(0, Ordering::Relaxed);
+                update_scale_selection(
+                    RESIZE_WIDTH.load(Ordering::Relaxed),
+                    RESIZE_HEIGHT.load(Ordering::Relaxed),
+                );
                 total_fixture_shape_uploads += u64::from(benchmark_cursor);
                 present_ready = false;
                 next_frame = Instant::now() + frame_period(FPS_LIMIT.load(Ordering::Relaxed));
@@ -625,6 +672,15 @@ pub fn run() -> windows::core::Result<()> {
                         let next = refreshed.get(next_index).ok_or_else(Error::from_win32)?;
                         CURRENT_MONITOR.store(next_index as u32, Ordering::Relaxed);
                         renderer = Renderer::new(next, hwnd, benchmark_cursor)?;
+                        let (source_width, source_height) = renderer.logical_source_size();
+                        SOURCE_WIDTH.store(source_width, Ordering::Relaxed);
+                        SOURCE_HEIGHT.store(source_height, Ordering::Relaxed);
+                        LAST_SIZE_MODE.store(0, Ordering::Relaxed);
+                        ACTUAL_SCALE.store(0, Ordering::Relaxed);
+                        update_scale_selection(
+                            RESIZE_WIDTH.load(Ordering::Relaxed),
+                            RESIZE_HEIGHT.load(Ordering::Relaxed),
+                        );
                         total_fixture_shape_uploads += u64::from(benchmark_cursor);
                         present_ready = false;
                         next_frame =
@@ -729,8 +785,13 @@ pub fn run() -> windows::core::Result<()> {
                 captured = 0;
                 presented = 0;
                 stats_at = Instant::now();
-                let title = format!("ExMonitorViewer | Capture {last_capture_fps:.0} FPS | Present submit {last_submit_fps:.0} FPS | {}x{} | {}",
-                    renderer.source_width, renderer.source_height, renderer.monitor_name);
+                let sizing_label = match LAST_SIZE_MODE.load(Ordering::Relaxed) {
+                    1 => format!(" | Fit {}%", ACTUAL_SCALE.load(Ordering::Relaxed)),
+                    2 => format!(" | Scale {}%", ACTUAL_SCALE.load(Ordering::Relaxed)),
+                    _ => String::new(),
+                };
+                let title = format!("ExMonitorViewer | Capture {last_capture_fps:.0} FPS | Present submit {last_submit_fps:.0} FPS | {}x{} | {}{}",
+                    renderer.source_width, renderer.source_height, renderer.monitor_name, sizing_label);
                 let title = wide(&title);
                 SetWindowTextW(hwnd, PCWSTR(title.as_ptr()))?;
             }
@@ -1050,6 +1111,14 @@ struct CursorConstants {
 }
 
 impl Renderer {
+    fn logical_source_size(&self) -> (u32, u32) {
+        if self.rotated {
+            (self.source_height, self.source_width)
+        } else {
+            (self.source_width, self.source_height)
+        }
+    }
+
     unsafe fn new(
         display: &Display,
         hwnd: HWND,
@@ -1741,10 +1810,17 @@ unsafe extern "system" fn window_proc(
                     SETTINGS_DIRTY.store(true, Ordering::Relaxed);
                 }
                 WINDOW_MAXIMIZED.store(maximized, Ordering::Relaxed);
+                if maximized {
+                    LAST_SIZE_MODE.store(0, Ordering::Relaxed);
+                    ACTUAL_SCALE.store(0, Ordering::Relaxed);
+                }
             }
             if !minimized {
-                RESIZE_WIDTH.store((lparam.0 as u32 & 0xffff).max(1), Ordering::Relaxed);
-                RESIZE_HEIGHT.store(((lparam.0 as u32 >> 16) & 0xffff).max(1), Ordering::Relaxed);
+                let client_width = (lparam.0 as u32 & 0xffff).max(1);
+                let client_height = ((lparam.0 as u32 >> 16) & 0xffff).max(1);
+                RESIZE_WIDTH.store(client_width, Ordering::Relaxed);
+                RESIZE_HEIGHT.store(client_height, Ordering::Relaxed);
+                update_scale_selection(client_width, client_height);
                 cache_window_rect(hwnd);
             }
             LRESULT(0)
@@ -1763,12 +1839,25 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_CLOSE => {
+            if !WINDOW_CLOSE_LOGGED.swap(true, Ordering::Relaxed) {
+                log_window_state(hwnd, "close");
+            }
             cache_window_rect(hwnd);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_COMMAND => {
             let id = wparam.0 & 0xffff;
             match id {
+                FIT_WINDOW_MENU => {
+                    ACTIVE_SCALE.store(0, Ordering::Relaxed);
+                    update_scale_menu_check();
+                    fit_window_to_image(hwnd);
+                }
+                SCALE_MENU_BASE..=SCALE_MENU_END => {
+                    let percent = SCALE_PRESETS[id - SCALE_MENU_BASE];
+                    scale_window_to_image(hwnd, percent);
+                    update_scale_selection_from_window(hwnd);
+                }
                 MONITOR_MENU_BASE..=2000 => {
                     CURRENT_MONITOR.store((id - MONITOR_MENU_BASE) as u32, Ordering::Relaxed);
                     SETTINGS_DIRTY.store(true, Ordering::Relaxed);
@@ -1828,6 +1917,11 @@ unsafe extern "system" fn window_proc(
             let key = wparam.0 as u32;
             match key {
                 0x7a => toggle_fullscreen(hwnd),
+                0x46 => {
+                    ACTIVE_SCALE.store(0, Ordering::Relaxed);
+                    update_scale_menu_check();
+                    fit_window_to_image(hwnd);
+                }
                 0x31..=0x39 => {
                     CURRENT_MONITOR.store(key - 0x31, Ordering::Relaxed);
                     SETTINGS_DIRTY.store(true, Ordering::Relaxed);
@@ -1835,6 +1929,11 @@ unsafe extern "system" fn window_proc(
                 _ => {}
             }
             LRESULT(0)
+        }
+        WM_ENTERSIZEMOVE => {
+            LAST_SIZE_MODE.store(0, Ordering::Relaxed);
+            ACTUAL_SCALE.store(0, Ordering::Relaxed);
+            DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_DISPLAYCHANGE => {
             DISPLAY_CHANGED.store(true, Ordering::Relaxed);
@@ -1853,6 +1952,8 @@ unsafe fn cache_window_rect(hwnd: HWND) {
     if FULLSCREEN.load(Ordering::Relaxed)
         || WINDOW_MINIMIZED.load(Ordering::Relaxed)
         || WINDOW_MAXIMIZED.load(Ordering::Relaxed)
+        || IsIconic(hwnd).as_bool()
+        || IsZoomed(hwnd).as_bool()
     {
         return;
     }
@@ -1877,7 +1978,244 @@ unsafe fn cache_window_rect(hwnd: HWND) {
     }
 }
 
+unsafe fn log_window_state(hwnd: HWND, reason: &str) {
+    let mut outer = RECT::default();
+    let mut client = RECT::default();
+    if GetWindowRect(hwnd, &mut outer).is_err() || GetClientRect(hwnd, &mut client).is_err() {
+        return;
+    }
+    let outer_width = outer.right.saturating_sub(outer.left);
+    let outer_height = outer.bottom.saturating_sub(outer.top);
+    let client_width = client.right.saturating_sub(client.left);
+    let client_height = client.bottom.saturating_sub(client.top);
+    let ex_style = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
+    let topmost = u8::from(ex_style.contains(WS_EX_TOPMOST));
+    let maximized = u8::from(IsZoomed(hwnd).as_bool());
+    log(&format!(
+        "Window state event={reason} outer={},{},{},{} client={}x{} topmost={topmost} maximized={maximized} monitor={} fps={}",
+        outer.left,
+        outer.top,
+        outer_width,
+        outer_height,
+        client_width,
+        client_height,
+        CURRENT_MONITOR.load(Ordering::Relaxed) + 1,
+        FPS_LIMIT.load(Ordering::Relaxed),
+    ));
+}
+
+unsafe fn update_scale_menu_check() {
+    let menu = HMENU(SCALE_MENU_HANDLE.load(Ordering::Relaxed) as *mut c_void);
+    let selected = ACTIVE_SCALE.load(Ordering::Relaxed);
+    for (index, percent) in SCALE_PRESETS.iter().enumerate() {
+        let state = if *percent == selected {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+        let _ = CheckMenuItem(
+            menu,
+            (SCALE_MENU_BASE + index) as u32,
+            (MF_BYCOMMAND | state).0,
+        );
+    }
+}
+
+unsafe fn update_scale_selection(client_width: u32, client_height: u32) {
+    let source_width = SOURCE_WIDTH.load(Ordering::Relaxed);
+    let source_height = SOURCE_HEIGHT.load(Ordering::Relaxed);
+    let selected = SCALE_PRESETS
+        .iter()
+        .copied()
+        .find(|percent| {
+            crate::math::scale_client_size(source_width, source_height, *percent)
+                == (client_width, client_height)
+        })
+        .unwrap_or(0);
+    ACTIVE_SCALE.store(selected, Ordering::Relaxed);
+    update_scale_menu_check();
+}
+
+unsafe fn update_scale_selection_from_window(hwnd: HWND) {
+    let mut client = RECT::default();
+    if GetClientRect(hwnd, &mut client).is_ok() {
+        update_scale_selection(
+            client.right.saturating_sub(client.left).max(0) as u32,
+            client.bottom.saturating_sub(client.top).max(0) as u32,
+        );
+    }
+}
+
+unsafe fn fit_window_to_image(hwnd: HWND) {
+    restore_normal_window(hwnd);
+    let mut client = RECT::default();
+    if GetClientRect(hwnd, &mut client).is_err() {
+        return;
+    }
+    let source_width = SOURCE_WIDTH.load(Ordering::Relaxed);
+    let source_height = SOURCE_HEIGHT.load(Ordering::Relaxed);
+    let (width, height) = crate::math::fit_client_size(
+        source_width,
+        source_height,
+        client.right.saturating_sub(client.left).max(0) as u32,
+        client.bottom.saturating_sub(client.top).max(0) as u32,
+    );
+    let actual = resize_client_to_source(hwnd, width, height);
+    ACTUAL_SCALE.store(actual, Ordering::Relaxed);
+    LAST_SIZE_MODE.store(1, Ordering::Relaxed);
+    update_scale_selection_from_window(hwnd);
+    let title = if actual > 0 {
+        wide(&format!("ExMonitorViewer - Fit ({actual}%)"))
+    } else {
+        wide("ExMonitorViewer")
+    };
+    let _ = SetWindowTextW(hwnd, PCWSTR(title.as_ptr()));
+}
+
+unsafe fn scale_window_to_image(hwnd: HWND, percent: u32) -> u32 {
+    restore_normal_window(hwnd);
+    let source_width = SOURCE_WIDTH.load(Ordering::Relaxed);
+    let source_height = SOURCE_HEIGHT.load(Ordering::Relaxed);
+    let (width, height) = crate::math::scale_client_size(source_width, source_height, percent);
+    let actual = resize_client_to_source(hwnd, width, height);
+    ACTUAL_SCALE.store(actual, Ordering::Relaxed);
+    LAST_SIZE_MODE.store(2, Ordering::Relaxed);
+    let title = if actual > 0 {
+        wide(&format!("ExMonitorViewer - {actual}%"))
+    } else {
+        wide("ExMonitorViewer")
+    };
+    let _ = SetWindowTextW(hwnd, PCWSTR(title.as_ptr()));
+    actual
+}
+
+unsafe fn restore_normal_window(hwnd: HWND) {
+    if FULLSCREEN.load(Ordering::Relaxed) {
+        toggle_fullscreen(hwnd);
+    }
+    if WINDOW_MAXIMIZED.load(Ordering::Relaxed) {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+    }
+}
+
+unsafe fn resize_client_to_source(hwnd: HWND, width: u32, height: u32) -> u32 {
+    if width == 0 || height == 0 {
+        return 0;
+    }
+    let source_width = SOURCE_WIDTH.load(Ordering::Relaxed);
+    let source_height = SOURCE_HEIGHT.load(Ordering::Relaxed);
+    if source_width == 0 || source_height == 0 {
+        return 0;
+    }
+    let mut window = RECT::default();
+    let mut client = RECT::default();
+    if GetWindowRect(hwnd, &mut window).is_err() || GetClientRect(hwnd, &mut client).is_err() {
+        return 0;
+    }
+    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut monitor_info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let has_workarea = GetMonitorInfoW(monitor, &mut monitor_info).as_bool();
+    let (work_width, work_height) = if has_workarea {
+        (
+            monitor_info
+                .rcWork
+                .right
+                .saturating_sub(monitor_info.rcWork.left),
+            monitor_info
+                .rcWork
+                .bottom
+                .saturating_sub(monitor_info.rcWork.top),
+        )
+    } else {
+        (i32::MAX / 2, i32::MAX / 2)
+    };
+    let work_width = work_width.min(8000);
+    let work_height = work_height.min(4500);
+    let requested_scale =
+        (width as f64 / source_width as f64).min(height as f64 / source_height as f64);
+    let mut frame_width = window
+        .right
+        .saturating_sub(window.left)
+        .saturating_sub(client.right.saturating_sub(client.left));
+    let mut frame_height = window
+        .bottom
+        .saturating_sub(window.top)
+        .saturating_sub(client.bottom.saturating_sub(client.top));
+    let mut final_client = (0u32, 0u32);
+    for _ in 0..4 {
+        let max_scale = ((work_width - frame_width).max(1) as f64 / source_width as f64)
+            .min((work_height - frame_height).max(1) as f64 / source_height as f64);
+        let min_scale = (((320 - frame_width).max(1) as f64 + 0.5) / source_width as f64)
+            .max(((240 - frame_height).max(1) as f64 + 0.5) / source_height as f64);
+        let scale = requested_scale.min(max_scale).max(min_scale.min(max_scale));
+        let client_width = (source_width as f64 * scale).round().max(1.0) as u32;
+        let client_height = (source_height as f64 * scale).round().max(1.0) as u32;
+        let outer_width = client_width as i32 + frame_width;
+        let outer_height = client_height as i32 + frame_height;
+        let mut left = window.left;
+        let mut top = window.top;
+        if has_workarea {
+            let max_left = monitor_info
+                .rcWork
+                .right
+                .saturating_sub(outer_width)
+                .max(monitor_info.rcWork.left);
+            let max_top = monitor_info
+                .rcWork
+                .bottom
+                .saturating_sub(outer_height)
+                .max(monitor_info.rcWork.top);
+            left = left.clamp(monitor_info.rcWork.left, max_left);
+            top = top.clamp(monitor_info.rcWork.top, max_top);
+        }
+        if SetWindowPos(
+            hwnd,
+            None,
+            left,
+            top,
+            outer_width,
+            outer_height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .is_err()
+        {
+            return 0;
+        }
+        if GetWindowRect(hwnd, &mut window).is_err() || GetClientRect(hwnd, &mut client).is_err() {
+            return 0;
+        }
+        final_client = (
+            client.right.saturating_sub(client.left).max(0) as u32,
+            client.bottom.saturating_sub(client.top).max(0) as u32,
+        );
+        let actual_frame_width = window
+            .right
+            .saturating_sub(window.left)
+            .saturating_sub(final_client.0 as i32);
+        let actual_frame_height = window
+            .bottom
+            .saturating_sub(window.top)
+            .saturating_sub(final_client.1 as i32);
+        if final_client == (client_width, client_height)
+            && actual_frame_width == frame_width
+            && actual_frame_height == frame_height
+        {
+            break;
+        }
+        frame_width = actual_frame_width;
+        frame_height = actual_frame_height;
+    }
+    let actual_scale = (final_client.0 as f64 / source_width as f64)
+        .min(final_client.1 as f64 / source_height as f64);
+    ((actual_scale * 100.0).round() as u32).max(1)
+}
+
 unsafe fn toggle_fullscreen(hwnd: HWND) {
+    LAST_SIZE_MODE.store(0, Ordering::Relaxed);
+    ACTUAL_SCALE.store(0, Ordering::Relaxed);
     let enabled = !FULLSCREEN.load(Ordering::Relaxed);
     if enabled {
         FULLSCREEN.store(true, Ordering::Relaxed);
