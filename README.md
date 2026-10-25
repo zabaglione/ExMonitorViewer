@@ -2,6 +2,12 @@
 
 Windows 11向けの拡張モニター表示アプリです。別のディスプレイをウィンドウに表示し、会議アプリの操作パネルを手元の画面で確認できます。
 
+## 利用に必要なディスプレイ構成
+
+Windowsに2台以上のディスプレイが認識され、「表示画面を拡張する」設定になっている必要があります。手元の画面にExMonitorViewerを開き、もう一方の画面を表示対象に選びます。
+
+表示対象は実モニターでなくても構いません。HDMIダミープラグ（ディスプレイエミュレーター／ダミーディスプレイ）を接続し、Windowsに拡張ディスプレイとして認識させれば利用できます。解像度とリフレッシュレートは、GPUとダミープラグが対応する範囲から選べます。
+
 ## ダウンロードと起動
 
 [最新リリース](https://github.com/zabaglione/ExMonitorViewer/releases/latest)を開き、ExMonitorViewerのWindows x64 ZIPをダウンロードして展開し、exmonitor-viewer.exe を起動してください。RustやVisual Studio Build Toolsのインストールは不要です。
