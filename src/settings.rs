@@ -10,7 +10,7 @@ pub struct Settings {
     pub monitor: Option<String>,
     pub fps: u32,
     pub topmost: bool,
-    #[serde(default)]
+    #[serde(default, rename = "dwm_composition", alias = "webex_controls")]
     pub webex_controls: bool,
     pub window: WindowSettings,
 }
@@ -246,23 +246,35 @@ mod tests {
     }
 
     #[test]
-    fn settings_without_webex_controls_default_to_disabled() {
+    fn settings_without_dwm_composition_default_to_disabled() {
         let json = r#"{"schema_version":1,"monitor":null,"fps":60,"topmost":false,"window":{"left":100,"top":100,"width":1000,"height":600,"maximized":false}}"#;
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert!(!settings.webex_controls);
     }
 
     #[test]
-    fn webex_controls_setting_round_trips_as_enabled() {
+    fn dwm_composition_setting_round_trips_with_generic_key() {
         let settings = Settings {
             webex_controls: true,
             ..Settings::default()
         };
         let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"dwm_composition\":true"));
+        assert!(!json.contains("webex_controls"));
         assert!(
             serde_json::from_str::<Settings>(&json)
                 .unwrap()
                 .webex_controls
         );
+    }
+
+    #[test]
+    fn legacy_webex_controls_setting_migrates_to_dwm_composition() {
+        let json = r#"{"schema_version":1,"monitor":null,"fps":60,"topmost":false,"webex_controls":true,"window":{"left":100,"top":100,"width":1000,"height":600,"maximized":false}}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert!(settings.webex_controls);
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(saved.contains("\"dwm_composition\":true"));
+        assert!(!saved.contains("webex_controls"));
     }
 }

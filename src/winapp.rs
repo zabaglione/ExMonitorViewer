@@ -5,11 +5,9 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io::Write;
 use std::mem::size_of;
-use std::os::windows::ffi::OsStringExt;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use windows::core::{w, Error, BOOL, HRESULT, PCSTR, PCWSTR, PWSTR};
+use windows::core::{w, Error, BOOL, HRESULT, PCSTR, PCWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
@@ -34,10 +32,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{
-    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-    PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_core::Interface;
@@ -221,7 +216,9 @@ fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result
                 options.benchmark_seconds = Some(seconds);
             }
             "--benchmark-cursor" => options.benchmark_cursor = true,
-            "--benchmark-webex-cursor" => options.benchmark_webex_cursor = true,
+            "--benchmark-composition-cursor" | "--benchmark-webex-cursor" => {
+                options.benchmark_webex_cursor = true
+            }
             "--report" => {
                 let path = values
                     .next()
@@ -236,8 +233,8 @@ fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result
                     .ok_or_else(invalid_arguments)?;
                 options.settings_file = Some(path.clone());
             }
-            "--webex-controls" => options.webex_controls = Some(true),
-            "--no-webex-controls" => options.webex_controls = Some(false),
+            "--dwm-composition" | "--webex-controls" => options.webex_controls = Some(true),
+            "--no-dwm-composition" | "--no-webex-controls" => options.webex_controls = Some(false),
             _ => return Err(invalid_arguments()),
         }
     }
@@ -283,11 +280,12 @@ pub fn run() -> windows::core::Result<()> {
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("ExMonitorViewer - GPU extended-display window viewer");
-        println!("Usage: exmonitor-viewer [--list-monitors] [--monitor N] [--fps 30|60|0] [--size WIDTHxHEIGHT] [--settings-file PATH] [--benchmark SECONDS] [--report PATH] [--webex-controls|--no-webex-controls]");
+        println!("Usage: exmonitor-viewer [--list-monitors] [--monitor N] [--fps 30|60|0] [--size WIDTHxHEIGHT] [--settings-file PATH] [--benchmark SECONDS] [--report PATH] [--dwm-composition|--no-dwm-composition]");
         println!("FPS 0 means unlimited. Monitor numbers are 1-based and match --list-monitors.");
         println!("--benchmark-cursor requires --benchmark and renders a synthetic GPU cursor for measurement.");
-        println!("--benchmark-webex-cursor requires --benchmark, --benchmark-cursor, and --webex-controls; it moves the synthetic cursor over a detected panel.");
-        println!("--webex-controls enables local-only Webex control thumbnails; --no-webex-controls disables them.");
+        println!("--benchmark-composition-cursor requires --benchmark and --dwm-composition; it moves only the proxy cursor over an eligible window for measurement.");
+        println!("--benchmark-cursor selects a synthetic cursor shape. Without it, the system cursor shape is used.");
+        println!("--benchmark-webex-cursor and --webex-controls|--no-webex-controls remain supported as legacy aliases.");
         return Ok(());
     }
     unsafe {
@@ -888,7 +886,7 @@ pub fn run() -> windows::core::Result<()> {
                                         error.code().0 as u32
                                     );
                                     if proxy_error.as_deref() != Some(message.as_str()) {
-                                        log(&format!("WARNING: Webex cursor proxy: {message}"));
+                                        log(&format!("WARNING: DWM cursor proxy: {message}"));
                                         proxy_errors += 1;
                                     }
                                     proxy_error = Some(message);
@@ -905,7 +903,7 @@ pub fn run() -> windows::core::Result<()> {
                                         error.code().0 as u32
                                     );
                                     if proxy_error.as_deref() != Some(message.as_str()) {
-                                        log(&format!("WARNING: Webex cursor proxy: {message}"));
+                                        log(&format!("WARNING: DWM cursor proxy: {message}"));
                                         proxy_errors += 1;
                                     }
                                     proxy_error = Some(message);
@@ -1010,7 +1008,7 @@ pub fn run() -> windows::core::Result<()> {
                 total_cursor_visible_presents, total_fixture_shape_uploads,
                 total_synthetic_position_updates, total_fixture_visible_presents,
                 if benchmark_cursor { "synthetic_benchmark" } else { "dxgi" },
-                if options.benchmark_webex_cursor { "webex_panel" } else { "default" },
+                if options.benchmark_webex_cursor { "composition_window" } else { "default" },
                 if options.benchmark_webex_cursor { "magenta" } else { "none" },
                 if options.benchmark_webex_cursor && benchmark_cursor { "synthetic_fixture" } else { "system_hcursor" },
                 if options.benchmark_webex_cursor { "diagnostic_panel_position" } else { "system_cursor_position" },
@@ -1118,7 +1116,7 @@ unsafe fn post_webex_menu_recheck(hwnd: HWND, reset_attempts: bool) {
 
 fn log_webex_ui_state(event: &str) {
     log(&format!(
-        "Webex UI event={event} enabled={} suspended={} epoch={} menu_enter={} menu_exit={} menu_toggle={} gui_flags={:08X}",
+        "DWM UI event={event} enabled={} suspended={} epoch={} menu_enter={} menu_exit={} menu_toggle={} gui_flags={:08X}",
         u32::from(WEBEX_CONTROLS.load(Ordering::Relaxed)),
         u32::from(WEBEX_OVERLAYS_SUSPENDED.load(Ordering::Relaxed)),
         WEBEX_STATE_EPOCH.load(Ordering::Relaxed),
@@ -1150,8 +1148,9 @@ unsafe extern "system" fn hide_owned_webex_overlay_window(hwnd: HWND, owner_para
         let mut class_name = [0u16; 64];
         let length = GetClassNameW(hwnd, &mut class_name);
         if length > 0
-            && String::from_utf16_lossy(&class_name[..length as usize])
-                == "ExMonitorViewerWebexOverlay"
+            && is_composition_overlay_class(&String::from_utf16_lossy(
+                &class_name[..length as usize],
+            ))
         {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
@@ -1246,8 +1245,8 @@ struct WebexWindow {
 
 struct WebexWindowScan {
     monitor: RECT,
+    own_pid: u32,
     windows: Vec<WebexWindow>,
-    process_paths: HashMap<u32, String>,
 }
 
 struct WebexOverlay {
@@ -1344,7 +1343,7 @@ impl WebexCursorProxy {
         let host_height = host_rect.bottom - host_rect.top;
         let hwnd = CreateWindowExW(
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP,
-            w!("ExMonitorViewerWebexOverlay"),
+            w!("ExMonitorViewerCompositionOverlay"),
             w!(""),
             WS_POPUP,
             host_rect.left,
@@ -1356,6 +1355,10 @@ impl WebexCursorProxy {
             Some(GetModuleHandleW(None)?.into()),
             None,
         )?;
+        if let Err(error) = mark_composition_overlay(hwnd) {
+            let _ = DestroyWindow(hwnd);
+            return Err(error);
+        }
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = UpdateWindow(hwnd);
@@ -1965,60 +1968,130 @@ unsafe extern "system" fn webex_overlay_proc(
     }
 }
 
-unsafe extern "system" fn collect_webex_windows(hwnd: HWND, parameter: LPARAM) -> BOOL {
+#[derive(Clone, Copy)]
+struct CompositionCandidate {
+    visible: bool,
+    iconic: bool,
+    rect: RECT,
+    topmost: bool,
+    affinity: Option<u32>,
+    cloaked: Option<u32>,
+}
+
+fn is_eligible_composition_source(candidate: CompositionCandidate, monitor: RECT) -> bool {
+    candidate.visible
+        && !candidate.iconic
+        && candidate.rect.right - candidate.rect.left >= 50
+        && candidate.rect.bottom - candidate.rect.top >= 24
+        && intersect_rect(candidate.rect, monitor).is_some()
+        && candidate.topmost
+        && candidate.affinity == Some(0x11)
+        && candidate.cloaked == Some(0)
+}
+
+fn is_legacy_composition_overlay_class(class_name: &str) -> bool {
+    class_name.eq_ignore_ascii_case("ExMonitorViewerWebexOverlay")
+}
+
+fn is_composition_overlay_class(class_name: &str) -> bool {
+    class_name.eq_ignore_ascii_case("ExMonitorViewerCompositionOverlay")
+        || is_legacy_composition_overlay_class(class_name)
+}
+
+fn should_exclude_composition_window(
+    own_pid: u32,
+    candidate_pid: u32,
+    has_marker: bool,
+    class_name: &str,
+) -> bool {
+    candidate_pid == own_pid || has_marker || is_composition_overlay_class(class_name)
+}
+
+unsafe fn has_composition_overlay_marker(hwnd: HWND) -> bool {
+    !GetPropW(hwnd, w!("ExMonitorViewer.CompositionOverlay"))
+        .0
+        .is_null()
+}
+
+unsafe fn has_legacy_composition_overlay_class(hwnd: HWND) -> bool {
+    let mut class_name = [0u16; 128];
+    let length = GetClassNameW(hwnd, &mut class_name);
+    if length <= 0 {
+        return true;
+    }
+    let class_name = String::from_utf16_lossy(&class_name[..length as usize]);
+    is_composition_overlay_class(&class_name)
+}
+
+fn mark_composition_overlay(hwnd: HWND) -> windows::core::Result<()> {
+    unsafe {
+        SetPropW(
+            hwnd,
+            w!("ExMonitorViewer.CompositionOverlay"),
+            Some(HANDLE(std::ptr::dangling_mut::<c_void>())),
+        )
+    }
+}
+
+unsafe extern "system" fn collect_composition_windows(hwnd: HWND, parameter: LPARAM) -> BOOL {
     let scan = &mut *(parameter.0 as *mut WebexWindowScan);
-    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+    let visible = IsWindowVisible(hwnd).as_bool();
+    let iconic = IsIconic(hwnd).as_bool();
+    if !visible || iconic {
         return BOOL(1);
     }
     let mut rect = RECT::default();
     if GetWindowRect(hwnd, &mut rect).is_err()
         || rect.right - rect.left < 50
         || rect.bottom - rect.top < 24
+        || intersect_rect(rect, scan.monitor).is_none()
     {
         return BOOL(1);
     }
-    if intersect_rect(rect, scan.monitor).is_none() {
-        return BOOL(1);
-    }
-    if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 == 0 {
+    let topmost = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+    if !topmost {
         return BOOL(1);
     }
     let mut affinity = 0u32;
-    if GetWindowDisplayAffinity(hwnd, &mut affinity).is_err() || affinity != 0x11 {
-        return BOOL(1);
-    }
+    let affinity = GetWindowDisplayAffinity(hwnd, &mut affinity)
+        .ok()
+        .map(|_| affinity);
     let mut cloaked = 0u32;
-    if DwmGetWindowAttribute(
+    let cloaked = DwmGetWindowAttribute(
         hwnd,
         DWMWA_CLOAKED,
         &mut cloaked as *mut _ as *mut c_void,
         size_of::<u32>() as u32,
     )
-    .is_err()
-        || cloaked != 0
-    {
+    .ok()
+    .map(|_| cloaked);
+    if !is_eligible_composition_source(
+        CompositionCandidate {
+            visible,
+            iconic,
+            rect,
+            topmost,
+            affinity,
+            cloaked,
+        },
+        scan.monitor,
+    ) {
         return BOOL(1);
     }
 
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    if pid == 0 {
-        return BOOL(1);
-    }
-    let basename = if let Some(name) = scan.process_paths.get(&pid) {
-        name.as_str()
-    } else {
-        let Ok(name) = process_basename(pid) else {
-            return BOOL(1);
-        };
-        scan.process_paths.insert(pid, name);
-        scan.process_paths
-            .get(&pid)
-            .map(String::as_str)
-            .unwrap_or("")
-    };
-    if !basename.eq_ignore_ascii_case("CiscoCollabHost.exe")
-        && !basename.eq_ignore_ascii_case("WebexHost.exe")
+    if pid == 0
+        || should_exclude_composition_window(
+            scan.own_pid,
+            pid,
+            has_composition_overlay_marker(hwnd),
+            if has_legacy_composition_overlay_class(hwnd) {
+                "ExMonitorViewerWebexOverlay"
+            } else {
+                ""
+            },
+        )
     {
         return BOOL(1);
     }
@@ -2029,33 +2102,6 @@ unsafe extern "system" fn collect_webex_windows(hwnd: HWND, parameter: LPARAM) -
         z_order: scan.windows.len(),
     });
     BOOL(1)
-}
-
-fn process_basename(pid: u32) -> windows::core::Result<String> {
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)? };
-    let result = (|| {
-        let mut buffer = vec![0u16; 32768];
-        let mut length = buffer.len() as u32;
-        unsafe {
-            QueryFullProcessImageNameW(
-                process,
-                PROCESS_NAME_FORMAT(0),
-                PWSTR(buffer.as_mut_ptr()),
-                &mut length,
-            )?;
-        }
-        let path = std::ffi::OsString::from_wide(&buffer[..length as usize]);
-        let name = Path::new(&path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        Ok(ascii(&name))
-    })();
-    unsafe {
-        let _ = CloseHandle(process);
-    }
-    result
 }
 
 fn intersect_rect(a: RECT, b: RECT) -> Option<RECT> {
@@ -2108,7 +2154,7 @@ impl WebexOverlayManager {
 
     fn report_error(&mut self, error: String) {
         if self.last_error.as_deref() != Some(error.as_str()) {
-            log(&format!("WARNING: Webex overlay: {error}"));
+            log(&format!("WARNING: DWM composition: {error}"));
             self.errors += 1;
         }
         self.last_error = Some(error);
@@ -2122,7 +2168,7 @@ impl WebexOverlayManager {
             let instance = GetModuleHandleW(None)?;
             let class = WNDCLASSW {
                 hInstance: instance.into(),
-                lpszClassName: w!("ExMonitorViewerWebexOverlay"),
+                lpszClassName: w!("ExMonitorViewerCompositionOverlay"),
                 lpfnWndProc: Some(webex_overlay_proc),
                 ..Default::default()
             };
@@ -2216,12 +2262,12 @@ impl WebexOverlayManager {
         };
         let mut scan = WebexWindowScan {
             monitor: monitor_rect,
+            own_pid: unsafe { GetCurrentProcessId() },
             windows: Vec::new(),
-            process_paths: HashMap::new(),
         };
         if let Err(error) = unsafe {
             EnumWindows(
-                Some(collect_webex_windows),
+                Some(collect_composition_windows),
                 LPARAM(&mut scan as *mut _ as isize),
             )
         } {
@@ -2388,7 +2434,7 @@ impl WebexOverlayManager {
             let instance = GetModuleHandleW(None)?;
             CreateWindowExW(
                 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
-                w!("ExMonitorViewerWebexOverlay"),
+                w!("ExMonitorViewerCompositionOverlay"),
                 w!(""),
                 WS_POPUP,
                 destination_rect.left,
@@ -2401,6 +2447,12 @@ impl WebexOverlayManager {
                 None,
             )?
         };
+        if let Err(error) = mark_composition_overlay(overlay) {
+            unsafe {
+                let _ = DestroyWindow(overlay);
+            }
+            return Err(error);
+        }
         unsafe {
             let _ = ShowWindow(overlay, SW_SHOWNOACTIVATE);
             let _ = UpdateWindow(overlay);
@@ -3725,9 +3777,9 @@ unsafe extern "system" fn window_proc(
                     );
                     let _ = DrawMenuBar(hwnd);
                     log(if enabled {
-                        "Webex local controls enabled"
+                        "DWM composition enabled"
                     } else {
-                        "Webex local controls disabled"
+                        "DWM composition disabled"
                     });
                     let _ = unsafe { snapshot_webex_gui_flags() };
                     log_webex_ui_state("toggle");
@@ -4154,6 +4206,112 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
 #[cfg(test)]
 mod cursor_shader_tests {
     use super::*;
+
+    #[test]
+    fn protected_composition_source_eligibility_is_process_name_independent() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let protected_fixture_from_a_separate_process = CompositionCandidate {
+            visible: true,
+            iconic: false,
+            rect: RECT {
+                left: 100,
+                top: 100,
+                right: 400,
+                bottom: 180,
+            },
+            topmost: true,
+            affinity: Some(0x11),
+            cloaked: Some(0),
+        };
+        assert!(is_eligible_composition_source(
+            protected_fixture_from_a_separate_process,
+            monitor
+        ));
+        for candidate in [
+            CompositionCandidate {
+                visible: false,
+                ..protected_fixture_from_a_separate_process
+            },
+            CompositionCandidate {
+                iconic: true,
+                ..protected_fixture_from_a_separate_process
+            },
+            CompositionCandidate {
+                rect: RECT {
+                    left: 10,
+                    top: 10,
+                    right: 59,
+                    bottom: 40,
+                },
+                ..protected_fixture_from_a_separate_process
+            },
+            CompositionCandidate {
+                rect: RECT {
+                    left: 1920,
+                    top: 100,
+                    right: 2220,
+                    bottom: 180,
+                },
+                ..protected_fixture_from_a_separate_process
+            },
+            CompositionCandidate {
+                topmost: false,
+                ..protected_fixture_from_a_separate_process
+            },
+            CompositionCandidate {
+                affinity: Some(0),
+                ..protected_fixture_from_a_separate_process
+            },
+            CompositionCandidate {
+                affinity: None,
+                ..protected_fixture_from_a_separate_process
+            },
+            CompositionCandidate {
+                cloaked: Some(1),
+                ..protected_fixture_from_a_separate_process
+            },
+            CompositionCandidate {
+                cloaked: None,
+                ..protected_fixture_from_a_separate_process
+            },
+        ] {
+            assert!(!is_eligible_composition_source(candidate, monitor));
+        }
+    }
+
+    #[test]
+    fn composition_window_exclusion_uses_pid_marker_and_legacy_class() {
+        assert!(should_exclude_composition_window(100, 100, false, ""));
+        assert!(should_exclude_composition_window(
+            100,
+            200,
+            true,
+            "RenamedAppClass"
+        ));
+        assert!(should_exclude_composition_window(
+            100,
+            200,
+            false,
+            "ExMonitorViewerWebexOverlay"
+        ));
+        assert!(should_exclude_composition_window(
+            100,
+            200,
+            false,
+            "ExMonitorViewerCompositionOverlay"
+        ));
+        assert!(!should_exclude_composition_window(
+            100,
+            200,
+            false,
+            "ProtectedFixtureWindow"
+        ));
+    }
 
     #[test]
     fn overlay_z_order_requires_panels_above_owner_in_source_order() {
@@ -4765,20 +4923,20 @@ mod cursor_shader_tests {
     }
 
     #[test]
-    fn webex_cursor_benchmark_requires_panel_capture_and_can_use_system_cursor() {
+    fn composition_cursor_benchmark_accepts_generic_and_legacy_flags() {
         let invalid = vec![
             "exmonitor-viewer".to_owned(),
             "--benchmark".to_owned(),
             "20".to_owned(),
-            "--benchmark-webex-cursor".to_owned(),
+            "--benchmark-composition-cursor".to_owned(),
         ];
         assert!(parse_options(&invalid, 1).is_err());
         let system_cursor = vec![
             "exmonitor-viewer".to_owned(),
             "--benchmark".to_owned(),
             "20".to_owned(),
-            "--webex-controls".to_owned(),
-            "--benchmark-webex-cursor".to_owned(),
+            "--dwm-composition".to_owned(),
+            "--benchmark-composition-cursor".to_owned(),
         ];
         let options = parse_options(&system_cursor, 1).unwrap();
         assert!(options.benchmark_webex_cursor);
@@ -4789,7 +4947,7 @@ mod cursor_shader_tests {
             "--benchmark".to_owned(),
             "20".to_owned(),
             "--benchmark-cursor".to_owned(),
-            "--webex-controls".to_owned(),
+            "--dwm-composition".to_owned(),
             "--benchmark-webex-cursor".to_owned(),
         ];
         let options = parse_options(&valid, 1).unwrap();
@@ -4824,19 +4982,35 @@ mod cursor_shader_tests {
     }
 
     #[test]
-    fn webex_controls_cli_flags_explicitly_enable_or_disable_the_overlay() {
-        let enable = vec!["exmonitor-viewer".to_owned(), "--webex-controls".to_owned()];
+    fn generic_and_legacy_cli_flags_explicitly_toggle_composition() {
+        let enable = vec![
+            "exmonitor-viewer".to_owned(),
+            "--dwm-composition".to_owned(),
+        ];
         assert_eq!(
             parse_options(&enable, 1).unwrap().webex_controls,
             Some(true)
         );
         let disable = vec![
             "exmonitor-viewer".to_owned(),
-            "--webex-controls".to_owned(),
-            "--no-webex-controls".to_owned(),
+            "--dwm-composition".to_owned(),
+            "--no-dwm-composition".to_owned(),
         ];
         assert_eq!(
             parse_options(&disable, 1).unwrap().webex_controls,
+            Some(false)
+        );
+        let legacy_enable = vec!["exmonitor-viewer".to_owned(), "--webex-controls".to_owned()];
+        assert_eq!(
+            parse_options(&legacy_enable, 1).unwrap().webex_controls,
+            Some(true)
+        );
+        let legacy_disable = vec![
+            "exmonitor-viewer".to_owned(),
+            "--no-webex-controls".to_owned(),
+        ];
+        assert_eq!(
+            parse_options(&legacy_disable, 1).unwrap().webex_controls,
             Some(false)
         );
     }

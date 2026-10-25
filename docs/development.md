@@ -18,11 +18,11 @@ Windows環境でRust、Windows SDK、Visual Studio C++ Build Toolsを用意し�
 
 カーソル合成を含める診断では --benchmark-cursor を追加します。これは固定の合成カーソルをGPUへ一度だけアップロードして描画する負荷確認用で、OSのマウス位置を動かしません。
 
-キャプチャ除外ウィンドウの合成機能（現在の対象はWebexコントロール）の描画負荷を確認するには、実際に対象パネルがビューアーに表示されている状態で次を使います。
+キャプチャ除外ウィンドウの合成描画負荷を確認するには、対象となる保護ウィンドウがビューアーに表示されている状態で次を使います。
 
-    .\dist\exmonitor-viewer.exe --monitor 2 --size 1920x1080 --benchmark 20 --webex-controls --benchmark-webex-cursor --report benchmark-webex-cursor.txt
+    .\dist\exmonitor-viewer.exe --monitor 2 --size 1920x1080 --benchmark 20 --dwm-composition --benchmark-composition-cursor --report benchmark-composition-cursor.txt
 
-この診断モードでは実際のOSカーソル形状を使い、プロキシ表示位置だけを検出パネル上へ動かして、ビューアー上でマゼンタ色にします。OSカーソル移動やWebexへの入力は行いません。proxy_shape_source と proxy_position_source で形状元と診断用位置を区別できます。proxy_visible_submits が0なら、追加レイヤーを有効にした計測にはなりません。Present submitはアプリからの提出数であり、実際のモニター走査出力数ではありません。
+この診断モードでは実際のOSカーソル形状を使い、プロキシ表示位置だけを検出ウィンドウ上へ動かして、ビューアー上でマゼンタ色にします。OSカーソル移動や対象アプリへの入力は行いません。proxy_shape_source と proxy_position_source で形状元と診断用位置を区別できます。proxy_visible_submits が0なら、追加レイヤーを有効にした計測にはなりません。Present submitはアプリからの提出数であり、実際のモニター走査出力数ではありません。
 
 合成カーソル自体の固定負荷だけを確認する場合は、上記に --benchmark-cursor を追加します。この場合はOSカーソル形状の代わりにテスト用形状を使用します。
 
