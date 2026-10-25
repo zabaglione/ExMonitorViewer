@@ -17,7 +17,7 @@ Windows 11向けの拡張モニター表示アプリです。別のディスプ�
 
 ## キャプチャ除外ウィンドウの合成（DWM）
 
-Windowsの画面共有キャプチャでは、キャプチャ除外に指定されたウィンドウは通常のキャプチャ結果に現れません。そのためWebexの操作パネルも、通常の画面複製ではビューアーに表示されないことがあります。メニューの「DWM composition: ON」を選ぶと、Windowsのデスクトップ合成器（DWM）から除外対象のWebexパネルを直接ビューアーへ重ねて表示します。初期状態ではOFFです。
+Windowsの画面共有キャプチャでは、キャプチャ除外に指定されたウィンドウは通常のキャプチャ結果に現れません。そのためWebexの操作パネルも、通常の画面複製ではビューアーに表示されないことがあります。メニューの「DWM composition」をクリックし、末尾の表示をOFFからONに切り替えると、Windowsのデスクトップ合成器（DWM）から除外対象のWebexパネルを直接ビューアーへ重ねて表示します。末尾のON/OFFは現在の状態を表します。初期状態はOFFです。
 
 パネルとその上のカーソル表示は画面共有から引き続き除外され、ビューアー映像は通常どおり共有できます。Webexの共有設定や入力は変更せず、会議名やウィンドウタイトルも読み取りません。現在の対応対象はWebexの操作パネルです。パネルが見つからない場合やOSが除外表示に対応できない場合は、表示しません。
 
@@ -26,7 +26,7 @@ Windowsの画面共有キャプチャでは、キャプチャ除外に指定さ�
 ## 設定とサポート
 設定は %LOCALAPPDATA%\ExMonitorViewer\settings.json に保存されます。画面構成が変わって保存先の画面が見つからない場合は、利用可能な画面を選択してください。保存位置が表示領域外にある場合は、ウィンドウを操作できる位置へ戻します。
 
-Windows 11 x64向けです。60 FPSは目標値で、元画面の更新頻度、GPU、Windowsのデスクトップ合成や他のアプリの負荷により実際の速度は変わります。HDR表示と複数GPU間の転送には対応していません。
+Windows 11 x64向けです。Microsoft Visual C++ v14 Redistributable (x64) が必要です。未導入で `VCRUNTIME140.dll` のエラーが出る場合は、[Microsoftのダウンロード案内](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)からx64版をインストールしてください。60 FPSは目標値で、元画面の更新頻度、GPU、Windowsのデスクトップ合成や他のアプリの負荷により実際の速度は変わります。HDR表示と複数GPU間の転送には対応していません。
 
 アプリと同じフォルダーの exmonitor-viewer.log をサポート時の調査に利用できます。ログに会議名やウィンドウタイトルは記録しません。
 
@@ -38,4 +38,4 @@ Windows 11 x64向けです。60 FPSは目標値で、元画面の更新頻度、
     cd ExMonitorViewer
     .\build.cmd
 
-開発者向けのCLI、計測方法、パッケージ作成方法は docs/development.md を参照してください。
+開発者向けのCLI、計測方法、パッケージ作成方法は[開発者向け情報](https://github.com/zabaglione/ExMonitorViewer/blob/main/docs/development.md)を参照してください。
