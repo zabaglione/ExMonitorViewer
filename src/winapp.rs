@@ -1,4 +1,5 @@
 use crate::cursor::{decode_shape, DecodedShape};
+use crate::settings::{self, Settings, WindowSettings};
 use std::ffi::c_void;
 use std::io::Write;
 use std::mem::size_of;
@@ -37,6 +38,9 @@ static WINDOW_TOP: AtomicI32 = AtomicI32::new(100);
 static WINDOW_WIDTH: AtomicI32 = AtomicI32::new(1000);
 static WINDOW_HEIGHT: AtomicI32 = AtomicI32::new(600);
 static WINDOW_MINIMIZED: AtomicBool = AtomicBool::new(false);
+static WINDOW_MAXIMIZED: AtomicBool = AtomicBool::new(false);
+static SETTINGS_TRACKING: AtomicBool = AtomicBool::new(false);
+static SETTINGS_DIRTY: AtomicBool = AtomicBool::new(false);
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static QUIT: AtomicBool = AtomicBool::new(false);
 
@@ -116,6 +120,7 @@ struct Options {
     benchmark_seconds: Option<u64>,
     benchmark_cursor: bool,
     report_path: Option<String>,
+    settings_file: Option<String>,
 }
 
 fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result<Options> {
@@ -127,6 +132,7 @@ fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result
         benchmark_seconds: None,
         benchmark_cursor: false,
         report_path: None,
+        settings_file: None,
     };
     let mut values = args.iter().skip(1);
     while let Some(argument) = values.next() {
@@ -177,6 +183,13 @@ fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result
                     .ok_or_else(invalid_arguments)?;
                 options.report_path = Some(path.clone());
             }
+            "--settings-file" => {
+                let path = values
+                    .next()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(invalid_arguments)?;
+                options.settings_file = Some(path.clone());
+            }
             _ => return Err(invalid_arguments()),
         }
     }
@@ -217,7 +230,7 @@ pub fn run() -> windows::core::Result<()> {
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("ExMonitorViewer - GPU extended-display window viewer");
-        println!("Usage: exmonitor-viewer [--list-monitors] [--monitor N] [--fps 30|60|0] [--size WIDTHxHEIGHT] [--benchmark SECONDS] [--report PATH]");
+        println!("Usage: exmonitor-viewer [--list-monitors] [--monitor N] [--fps 30|60|0] [--size WIDTHxHEIGHT] [--settings-file PATH] [--benchmark SECONDS] [--report PATH]");
         println!("FPS 0 means unlimited. Monitor numbers are 1-based and match --list-monitors.");
         println!("--benchmark-cursor requires --benchmark and renders a synthetic GPU cursor for measurement.");
         return Ok(());
@@ -247,17 +260,55 @@ pub fn run() -> windows::core::Result<()> {
             return Ok(());
         }
 
-        let initial = options
-            .monitor
-            .unwrap_or_else(|| displays.iter().position(|d| !d.primary).unwrap_or(0));
+        let settings_path = if let Some(path) = options.settings_file.as_ref() {
+            Some(std::path::PathBuf::from(path))
+        } else {
+            settings::default_path()
+        };
+        let loaded_settings = if options.benchmark_seconds.is_none() {
+            settings_path.as_deref().and_then(|path| {
+                if !path.exists() {
+                    return None;
+                }
+                match settings::load(path) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        log(&format!("WARNING: {error}; using defaults"));
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        let monitor_identities = displays
+            .iter()
+            .map(|display| (display.name.clone(), display.primary))
+            .collect::<Vec<_>>();
+        let initial = settings::choose_monitor(
+            options.monitor,
+            loaded_settings
+                .as_ref()
+                .and_then(|settings| settings.monitor.as_deref()),
+            &monitor_identities,
+        );
         let current = initial.min(displays.len() - 1);
         CURRENT_MONITOR.store(current as u32, Ordering::Relaxed);
-        let fps = options.fps.unwrap_or(60);
+        let fps = options
+            .fps
+            .or_else(|| loaded_settings.as_ref().map(|s| s.fps))
+            .unwrap_or(60);
         FPS_LIMIT.store(fps, Ordering::Relaxed);
         let benchmark_seconds = options.benchmark_seconds;
         let benchmark_cursor = options.benchmark_cursor;
         let report_path = options.report_path;
-        let (client_width, client_height) = options.size.unwrap_or((960, 540));
+        let (client_width, client_height) = options.size.unwrap_or_else(|| {
+            loaded_settings
+                .as_ref()
+                .map(|s| (s.window.width, s.window.height))
+                .unwrap_or((960, 540))
+        });
         RESIZE_WIDTH.store(client_width, Ordering::Relaxed);
         RESIZE_HEIGHT.store(client_height, Ordering::Relaxed);
 
@@ -293,6 +344,13 @@ pub fn run() -> windows::core::Result<()> {
                 PCWSTR(label.as_ptr()),
             )?;
         }
+        let _ = CheckMenuRadioItem(
+            monitor_menu,
+            MONITOR_MENU_BASE as u32,
+            (MONITOR_MENU_BASE + displays.len() - 1) as u32,
+            (MONITOR_MENU_BASE + current) as u32,
+            MF_BYCOMMAND.0,
+        );
         let fps_menu = CreatePopupMenu()?;
         AppendMenuW(fps_menu, MF_STRING, FPS_MENU_30, w!("30 FPS"))?;
         AppendMenuW(fps_menu, MF_STRING, FPS_MENU_60, w!("60 FPS"))?;
@@ -301,6 +359,24 @@ pub fn run() -> windows::core::Result<()> {
         AppendMenuW(menu, MF_POPUP, monitor_menu.0 as usize, w!("Monitor"))?;
         AppendMenuW(menu, MF_POPUP, fps_menu.0 as usize, w!("FPS"))?;
         AppendMenuW(menu, MF_STRING, TOPMOST_MENU, w!("Always on top"))?;
+        let _ = CheckMenuRadioItem(
+            fps_menu,
+            FPS_MENU_30 as u32,
+            FPS_MENU_MAX as u32,
+            match fps {
+                30 => FPS_MENU_30 as u32,
+                60 => FPS_MENU_60 as u32,
+                _ => FPS_MENU_MAX as u32,
+            },
+            MF_BYCOMMAND.0,
+        );
+        if loaded_settings
+            .as_ref()
+            .is_some_and(|settings| settings.topmost)
+        {
+            TOPMOST.store(true, Ordering::Relaxed);
+            CheckMenuItem(menu, TOPMOST_MENU as u32, (MF_BYCOMMAND | MF_CHECKED).0);
+        }
 
         let mut window_rect = RECT {
             left: 0,
@@ -309,29 +385,87 @@ pub fn run() -> windows::core::Result<()> {
             bottom: client_height as i32,
         };
         AdjustWindowRectEx(&mut window_rect, WS_OVERLAPPEDWINDOW, true, WS_EX_APPWINDOW)?;
+        let default_display = displays
+            .iter()
+            .find(|display| display.primary)
+            .unwrap_or(&displays[0]);
+        let window_display = loaded_settings
+            .as_ref()
+            .and_then(|settings| {
+                displays
+                    .iter()
+                    .max_by_key(|display| window_workarea_overlap(settings.window, display))
+                    .filter(|display| window_workarea_overlap(settings.window, display) > 0)
+            })
+            .unwrap_or(default_display);
+        let restored = loaded_settings.as_ref().map(|settings| {
+            settings::clamp_rect(
+                settings.window.left,
+                settings.window.top,
+                settings.window.width,
+                settings.window.height,
+                (
+                    window_display.work_left,
+                    window_display.work_top,
+                    window_display.work_right,
+                    window_display.work_bottom,
+                ),
+            )
+        });
+        let initial_left = restored
+            .map(|window| window.left)
+            .unwrap_or(default_display.left + 80);
+        let initial_top = restored
+            .map(|window| window.top)
+            .unwrap_or(default_display.top + 80);
+        let initial_width = if options.size.is_some() {
+            window_rect.right - window_rect.left
+        } else {
+            restored
+                .map(|window| window.width as i32)
+                .unwrap_or(window_rect.right - window_rect.left)
+        };
+        let initial_height = if options.size.is_some() {
+            window_rect.bottom - window_rect.top
+        } else {
+            restored
+                .map(|window| window.height as i32)
+                .unwrap_or(window_rect.bottom - window_rect.top)
+        };
         let hwnd = CreateWindowExW(
             WS_EX_APPWINDOW,
             class,
             w!("ExMonitorViewer"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            displays
-                .iter()
-                .find(|display| display.primary)
-                .map(|display| display.left + 80)
-                .unwrap_or(80),
-            displays
-                .iter()
-                .find(|display| display.primary)
-                .map(|display| display.top + 80)
-                .unwrap_or(80),
-            window_rect.right - window_rect.left,
-            window_rect.bottom - window_rect.top,
+            initial_left,
+            initial_top,
+            initial_width,
+            initial_height,
             None,
             Some(menu),
             Some(instance.into()),
             None,
         )?;
         APP_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+        cache_window_rect(hwnd);
+        if TOPMOST.load(Ordering::Relaxed) {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE,
+            );
+        }
+        if options.size.is_none()
+            && loaded_settings
+                .as_ref()
+                .is_some_and(|settings| settings.window.maximized)
+        {
+            let _ = ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+        }
         let _ = SendMessageW(
             hwnd,
             WM_SETICON,
@@ -346,6 +480,7 @@ pub fn run() -> windows::core::Result<()> {
         );
 
         let mut renderer = Renderer::new(&displays[current], hwnd, benchmark_cursor)?;
+        SETTINGS_TRACKING.store(true, Ordering::Relaxed);
         log("GPU capture renderer initialized");
         let mut message = MSG::default();
         let initial_limit = FPS_LIMIT.load(Ordering::Relaxed);
@@ -617,6 +752,41 @@ pub fn run() -> windows::core::Result<()> {
             );
             std::fs::write(path, report)?;
         }
+        if benchmark_seconds.is_none() {
+            if let Some(path) = settings_path.as_deref() {
+                if loaded_settings.is_none()
+                    && path.exists()
+                    && !SETTINGS_DIRTY.load(Ordering::Relaxed)
+                {
+                    log("WARNING: settings were invalid; preserving the file because no settings changed");
+                    return Ok(());
+                }
+                let selected_monitor = enumerate_displays()
+                    .ok()
+                    .and_then(|current_displays| {
+                        current_displays
+                            .get(CURRENT_MONITOR.load(Ordering::Relaxed) as usize)
+                            .map(|d| d.name.clone())
+                    })
+                    .unwrap_or_else(|| renderer.monitor_name.clone());
+                let saved = Settings {
+                    schema_version: 1,
+                    monitor: Some(selected_monitor),
+                    fps: FPS_LIMIT.load(Ordering::Relaxed),
+                    topmost: TOPMOST.load(Ordering::Relaxed),
+                    window: WindowSettings {
+                        left: WINDOW_LEFT.load(Ordering::Relaxed),
+                        top: WINDOW_TOP.load(Ordering::Relaxed),
+                        width: WINDOW_WIDTH.load(Ordering::Relaxed).clamp(320, 8000) as u32,
+                        height: WINDOW_HEIGHT.load(Ordering::Relaxed).clamp(240, 4500) as u32,
+                        maximized: WINDOW_MAXIMIZED.load(Ordering::Relaxed),
+                    },
+                };
+                if let Err(error) = settings::save(path, &saved) {
+                    log(&format!("WARNING: {error}; settings were not saved"));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -691,11 +861,29 @@ struct Display {
     height: u32,
     left: i32,
     top: i32,
+    work_left: i32,
+    work_top: i32,
+    work_right: i32,
+    work_bottom: i32,
     rotation: DXGI_MODE_ROTATION,
     primary: bool,
     output: IDXGIOutput,
     adapter: IDXGIAdapter1,
     factory: IDXGIFactory1,
+}
+
+fn window_workarea_overlap(window: WindowSettings, display: &Display) -> i64 {
+    let right = window.left.saturating_add(window.width as i32);
+    let bottom = window.top.saturating_add(window.height as i32);
+    let overlap_w = right
+        .min(display.work_right)
+        .saturating_sub(window.left.max(display.work_left))
+        .max(0) as i64;
+    let overlap_h = bottom
+        .min(display.work_bottom)
+        .saturating_sub(window.top.max(display.work_top))
+        .max(0) as i64;
+    overlap_w * overlap_h
 }
 
 unsafe fn enumerate_displays() -> windows::core::Result<Vec<Display>> {
@@ -738,12 +926,17 @@ unsafe fn enumerate_displays() -> windows::core::Result<Vec<Display>> {
                 let monitor = description.Monitor;
                 let primary =
                     GetMonitorInfoW(monitor, &mut info).as_bool() && info.dwFlags & 1 != 0;
+                let work = info.rcWork;
                 displays.push(Display {
                     name,
                     width,
                     height,
                     left: description.DesktopCoordinates.left,
                     top: description.DesktopCoordinates.top,
+                    work_left: work.left,
+                    work_top: work.top,
+                    work_right: work.right,
+                    work_bottom: work.bottom,
                     rotation: description.Rotation,
                     primary,
                     output,
@@ -781,6 +974,16 @@ unsafe fn refresh_monitor_menu(displays: &[Display], hwnd: HWND) -> windows::cor
             MONITOR_MENU_BASE + index,
             PCWSTR(label.as_ptr()),
         )?;
+    }
+    if !displays.is_empty() {
+        let current = (CURRENT_MONITOR.load(Ordering::Relaxed) as usize).min(displays.len() - 1);
+        let _ = CheckMenuRadioItem(
+            menu,
+            MONITOR_MENU_BASE as u32,
+            (MONITOR_MENU_BASE + displays.len() - 1) as u32,
+            (MONITOR_MENU_BASE + current) as u32,
+            MF_BYCOMMAND.0,
+        );
     }
     DrawMenuBar(hwnd)
 }
@@ -1530,17 +1733,54 @@ unsafe extern "system" fn window_proc(
         WM_SIZE => {
             let minimized = wparam.0 == SIZE_MINIMIZED as usize;
             WINDOW_MINIMIZED.store(minimized, Ordering::Relaxed);
+            if !FULLSCREEN.load(Ordering::Relaxed) && !minimized {
+                let maximized = wparam.0 == SIZE_MAXIMIZED as usize;
+                if SETTINGS_TRACKING.load(Ordering::Relaxed)
+                    && WINDOW_MAXIMIZED.load(Ordering::Relaxed) != maximized
+                {
+                    SETTINGS_DIRTY.store(true, Ordering::Relaxed);
+                }
+                WINDOW_MAXIMIZED.store(maximized, Ordering::Relaxed);
+            }
             if !minimized {
                 RESIZE_WIDTH.store((lparam.0 as u32 & 0xffff).max(1), Ordering::Relaxed);
                 RESIZE_HEIGHT.store(((lparam.0 as u32 >> 16) & 0xffff).max(1), Ordering::Relaxed);
+                cache_window_rect(hwnd);
             }
             LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            let info = lparam.0 as *mut MINMAXINFO;
+            if !info.is_null() {
+                let info = &mut *info;
+                info.ptMinTrackSize.x = 320;
+                info.ptMinTrackSize.y = 240;
+            }
+            LRESULT(0)
+        }
+        WM_MOVE => {
+            cache_window_rect(hwnd);
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            cache_window_rect(hwnd);
+            DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_COMMAND => {
             let id = wparam.0 & 0xffff;
             match id {
                 MONITOR_MENU_BASE..=2000 => {
-                    CURRENT_MONITOR.store((id - MONITOR_MENU_BASE) as u32, Ordering::Relaxed)
+                    CURRENT_MONITOR.store((id - MONITOR_MENU_BASE) as u32, Ordering::Relaxed);
+                    SETTINGS_DIRTY.store(true, Ordering::Relaxed);
+                    let menu = HMENU(MONITOR_MENU_HANDLE.load(Ordering::Relaxed) as *mut c_void);
+                    let count = GetMenuItemCount(Some(menu)).max(1) as usize;
+                    let _ = CheckMenuRadioItem(
+                        menu,
+                        MONITOR_MENU_BASE as u32,
+                        (MONITOR_MENU_BASE + count - 1) as u32,
+                        id as u32,
+                        MF_BYCOMMAND.0,
+                    );
                 }
                 FPS_MENU_30 => FPS_LIMIT.store(30, Ordering::Relaxed),
                 FPS_MENU_60 => FPS_LIMIT.store(60, Ordering::Relaxed),
@@ -1548,6 +1788,7 @@ unsafe extern "system" fn window_proc(
                 TOPMOST_MENU => {
                     let enabled = !TOPMOST.load(Ordering::Relaxed);
                     TOPMOST.store(enabled, Ordering::Relaxed);
+                    SETTINGS_DIRTY.store(true, Ordering::Relaxed);
                     let _ = SetWindowPos(
                         hwnd,
                         Some(if enabled {
@@ -1561,8 +1802,25 @@ unsafe extern "system" fn window_proc(
                         0,
                         SWP_NOMOVE | SWP_NOSIZE,
                     );
+                    let menu = GetMenu(hwnd);
+                    let _ = CheckMenuItem(
+                        menu,
+                        TOPMOST_MENU as u32,
+                        (MF_BYCOMMAND | if enabled { MF_CHECKED } else { MF_UNCHECKED }).0,
+                    );
                 }
                 _ => {}
+            }
+            if matches!(id, FPS_MENU_30 | FPS_MENU_60 | FPS_MENU_MAX) {
+                SETTINGS_DIRTY.store(true, Ordering::Relaxed);
+                let menu = GetMenu(hwnd);
+                let _ = CheckMenuRadioItem(
+                    menu,
+                    FPS_MENU_30 as u32,
+                    FPS_MENU_MAX as u32,
+                    id as u32,
+                    MF_BYCOMMAND.0,
+                );
             }
             LRESULT(0)
         }
@@ -1570,7 +1828,10 @@ unsafe extern "system" fn window_proc(
             let key = wparam.0 as u32;
             match key {
                 0x7a => toggle_fullscreen(hwnd),
-                0x31..=0x39 => CURRENT_MONITOR.store(key - 0x31, Ordering::Relaxed),
+                0x31..=0x39 => {
+                    CURRENT_MONITOR.store(key - 0x31, Ordering::Relaxed);
+                    SETTINGS_DIRTY.store(true, Ordering::Relaxed);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -1588,17 +1849,38 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+unsafe fn cache_window_rect(hwnd: HWND) {
+    if FULLSCREEN.load(Ordering::Relaxed)
+        || WINDOW_MINIMIZED.load(Ordering::Relaxed)
+        || WINDOW_MAXIMIZED.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_ok() {
+        let width = rect.right.saturating_sub(rect.left);
+        let height = rect.bottom.saturating_sub(rect.top);
+        if (320..=8000).contains(&width) && (240..=4500).contains(&height) {
+            if SETTINGS_TRACKING.load(Ordering::Relaxed)
+                && (WINDOW_LEFT.load(Ordering::Relaxed) != rect.left
+                    || WINDOW_TOP.load(Ordering::Relaxed) != rect.top
+                    || WINDOW_WIDTH.load(Ordering::Relaxed) != width
+                    || WINDOW_HEIGHT.load(Ordering::Relaxed) != height)
+            {
+                SETTINGS_DIRTY.store(true, Ordering::Relaxed);
+            }
+            WINDOW_LEFT.store(rect.left, Ordering::Relaxed);
+            WINDOW_TOP.store(rect.top, Ordering::Relaxed);
+            WINDOW_WIDTH.store(width, Ordering::Relaxed);
+            WINDOW_HEIGHT.store(height, Ordering::Relaxed);
+        }
+    }
+}
+
 unsafe fn toggle_fullscreen(hwnd: HWND) {
     let enabled = !FULLSCREEN.load(Ordering::Relaxed);
-    FULLSCREEN.store(enabled, Ordering::Relaxed);
     if enabled {
-        let mut current = RECT::default();
-        if GetWindowRect(hwnd, &mut current).is_ok() {
-            WINDOW_LEFT.store(current.left, Ordering::Relaxed);
-            WINDOW_TOP.store(current.top, Ordering::Relaxed);
-            WINDOW_WIDTH.store(current.right - current.left, Ordering::Relaxed);
-            WINDOW_HEIGHT.store(current.bottom - current.top, Ordering::Relaxed);
-        }
+        FULLSCREEN.store(true, Ordering::Relaxed);
         let monitor = MonitorFromPoint(
             windows::Win32::Foundation::POINT { x: 0, y: 0 },
             MONITOR_DEFAULTTOPRIMARY,
@@ -1624,6 +1906,7 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
             );
         }
     } else {
+        let restore_maximized = WINDOW_MAXIMIZED.load(Ordering::Relaxed);
         SetWindowLongPtrW(
             hwnd,
             GWL_STYLE,
@@ -1642,6 +1925,10 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
             WINDOW_HEIGHT.load(Ordering::Relaxed),
             SWP_FRAMECHANGED | SWP_SHOWWINDOW,
         );
+        FULLSCREEN.store(false, Ordering::Relaxed);
+        if restore_maximized {
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        }
     }
 }
 
@@ -1890,6 +2177,32 @@ mod cursor_shader_tests {
         let options = parse_options(&benchmark, 1).unwrap();
         assert!(options.benchmark_cursor);
         assert_eq!(options.benchmark_seconds, Some(20));
+    }
+
+    #[test]
+    fn parses_settings_file_without_changing_benchmark_options() {
+        let args = vec![
+            "exmonitor-viewer".to_owned(),
+            "--settings-file".to_owned(),
+            "isolated/settings.json".to_owned(),
+            "--monitor".to_owned(),
+            "2".to_owned(),
+            "--fps".to_owned(),
+            "30".to_owned(),
+            "--size".to_owned(),
+            "800x450".to_owned(),
+            "--benchmark".to_owned(),
+            "5".to_owned(),
+        ];
+        let options = parse_options(&args, 2).unwrap();
+        assert_eq!(
+            options.settings_file.as_deref(),
+            Some("isolated/settings.json")
+        );
+        assert_eq!(options.monitor, Some(1));
+        assert_eq!(options.fps, Some(30));
+        assert_eq!(options.size, Some((800, 450)));
+        assert_eq!(options.benchmark_seconds, Some(5));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 mod cursor;
 mod math;
+mod settings;
 mod winapp;
 
 fn main() {
