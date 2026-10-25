@@ -1,5 +1,6 @@
 use crate::cursor::{decode_shape, DecodedShape};
 use crate::settings::{self, Settings, WindowSettings};
+use crate::update::{self, CheckKind, ReleaseInfo, UpdateCheck};
 use crate::win32_cursor;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -63,6 +64,8 @@ static WINDOW_CLOSE_LOGGED: AtomicBool = AtomicBool::new(false);
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static QUIT: AtomicBool = AtomicBool::new(false);
 static WEBEX_CONTROLS: AtomicBool = AtomicBool::new(false);
+static CHECK_UPDATES_ON_STARTUP: AtomicBool = AtomicBool::new(true);
+static MANUAL_UPDATE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static WEBEX_OVERLAYS_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static WEBEX_STATE_EPOCH: AtomicU32 = AtomicU32::new(0);
 static WEBEX_MENU_ENTER_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -80,6 +83,8 @@ const FPS_MENU_60: usize = 9002;
 const FPS_MENU_MAX: usize = 9003;
 const TOPMOST_MENU: usize = 9004;
 const WEBEX_CONTROLS_MENU: usize = 9005;
+const CHECK_UPDATES_MENU: usize = 9006;
+const CHECK_UPDATES_STARTUP_MENU: usize = 9007;
 const WM_APP_WEBEX_MENU_RECHECK: u32 = WM_APP + 0x42;
 const FIT_WINDOW_MENU: usize = 9010;
 const SCALE_MENU_BASE: usize = 9020;
@@ -159,6 +164,7 @@ struct Options {
     report_path: Option<String>,
     settings_file: Option<String>,
     webex_controls: Option<bool>,
+    check_updates: bool,
 }
 
 fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result<Options> {
@@ -173,11 +179,13 @@ fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result
         report_path: None,
         settings_file: None,
         webex_controls: None,
+        check_updates: false,
     };
     let mut values = args.iter().skip(1);
     while let Some(argument) = values.next() {
         match argument.as_str() {
             "--list-monitors" => options.list_monitors = true,
+            "--check-updates" => options.check_updates = true,
             "--monitor" => {
                 let number = values
                     .next()
@@ -268,24 +276,188 @@ pub fn show_error(message: &str) {
     }
 }
 
+#[derive(Default)]
+struct UpdateUi {
+    active: Option<UpdateCheck>,
+    pending: Option<(CheckKind, Result<ReleaseInfo, String>)>,
+}
+
+impl UpdateUi {
+    fn start(&mut self, kind: CheckKind) {
+        if let Some(active) = self.active.as_mut() {
+            if kind == CheckKind::Manual {
+                active.kind = CheckKind::Manual;
+            }
+            return;
+        }
+        if let Some((pending_kind, _)) = self.pending.as_mut() {
+            if kind == CheckKind::Manual {
+                *pending_kind = CheckKind::Manual;
+            }
+            return;
+        }
+        match UpdateCheck::start(kind) {
+            Some(check) => self.active = Some(check),
+            None if kind == CheckKind::Manual => {
+                self.pending = Some((kind, Err("update worker could not start".into())))
+            }
+            None => log("WARNING: update worker could not start"),
+        }
+    }
+
+    fn poll(&mut self) {
+        let Some(check) = self.active.as_ref() else {
+            return;
+        };
+        match check.try_finish() {
+            Ok(Some(result)) => {
+                let kind = check.kind;
+                self.active = None;
+                if kind == CheckKind::Automatic
+                    && result.as_ref().is_ok_and(|release| {
+                        !update::is_newer(release.version, update::current_version())
+                    })
+                {
+                    return;
+                }
+                if kind == CheckKind::Automatic && result.is_err() {
+                    if let Err(error) = result {
+                        log(&format!("WARNING: automatic update check failed: {error}"));
+                    }
+                    return;
+                }
+                self.pending = Some((kind, result));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let kind = check.kind;
+                self.active = None;
+                if kind == CheckKind::Manual {
+                    self.pending = Some((kind, Err(error)));
+                } else {
+                    log(&format!("WARNING: automatic update check failed: {error}"));
+                }
+            }
+        }
+    }
+}
+
+fn present_update_if_ready(hwnd: HWND, update_ui: &mut UpdateUi) {
+    if update_ui.pending.is_none()
+        || unsafe { GetForegroundWindow() } != hwnd
+        || WINDOW_MINIMIZED.load(Ordering::Relaxed)
+        || IN_SIZE_MOVE.load(Ordering::Relaxed)
+        || WEBEX_OVERLAYS_SUSPENDED.load(Ordering::Relaxed)
+    {
+        return;
+    }
+    let (kind, result) = update_ui.pending.take().expect("pending update checked");
+    let current = update::current_version();
+    match update::classify_result(
+        kind,
+        result,
+        current,
+        CHECK_UPDATES_ON_STARTUP.load(Ordering::Relaxed),
+    ) {
+        update::Notification::Discard | update::Notification::Silent => {}
+        update::Notification::UpToDate(version) => {
+            show_update_message(
+                hwnd,
+                &format!("You are using the latest version ({version})."),
+                false,
+            );
+        }
+        update::Notification::ManualError(error) => {
+            show_update_message(
+                hwnd,
+                &format!("Could not check for updates: {error}"),
+                false,
+            );
+        }
+        update::Notification::AutomaticError(error) => {
+            log(&format!("WARNING: automatic update check failed: {error}"));
+        }
+        update::Notification::UpdateAvailable(version) => {
+            let message = format!(
+                "version {version} available (current {current}). Open the download page in your browser?"
+            );
+            let target =
+                update::release_page_after_confirmation(show_update_message(hwnd, &message, true));
+            if let Some(target) = target {
+                use windows::Win32::UI::Shell::ShellExecuteW;
+                let url = wide(target);
+                let result = unsafe {
+                    ShellExecuteW(
+                        Some(hwnd),
+                        windows::core::w!("open"),
+                        windows::core::PCWSTR(url.as_ptr()),
+                        windows::core::PCWSTR::null(),
+                        windows::core::PCWSTR::null(),
+                        SW_SHOWNORMAL,
+                    )
+                };
+                if result.0 as isize <= 32 {
+                    show_update_message(
+                        hwnd,
+                        "Could not open the release page in your browser.",
+                        false,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn show_update_message(hwnd: HWND, message: &str, confirmation: bool) -> bool {
+    unsafe {
+        hide_owned_webex_overlays(hwnd);
+        let body = wide(message);
+        let caption = wide("ExMonitorViewer");
+        let flags = if confirmation {
+            MB_ICONINFORMATION | MB_YESNO | MB_DEFBUTTON2
+        } else {
+            MB_ICONINFORMATION | MB_OK
+        };
+        let response = MessageBoxW(
+            Some(hwnd),
+            PCWSTR(body.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            flags,
+        );
+        invalidate_webex_state();
+        confirmation && response == IDYES
+    }
+}
+
 pub fn run() -> windows::core::Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
-    if args
-        .iter()
-        .any(|arg| arg == "--help" || arg == "-h" || arg == "--list-monitors")
-    {
+    if args.iter().any(|arg| {
+        arg == "--help" || arg == "-h" || arg == "--list-monitors" || arg == "--check-updates"
+    }) {
         unsafe {
             let _ = AttachConsole(ATTACH_PARENT_PROCESS);
         }
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("ExMonitorViewer - GPU extended-display window viewer");
-        println!("Usage: exmonitor-viewer [--list-monitors] [--monitor N] [--fps 30|60|0] [--size WIDTHxHEIGHT] [--settings-file PATH] [--benchmark SECONDS] [--report PATH] [--dwm-composition|--no-dwm-composition]");
+        println!("Usage: exmonitor-viewer [--list-monitors|--check-updates] [--monitor N] [--fps 30|60|0] [--size WIDTHxHEIGHT] [--settings-file PATH] [--benchmark SECONDS] [--report PATH] [--dwm-composition|--no-dwm-composition]");
+        println!("--check-updates checks the latest stable release and prints an ASCII JSON result without opening a browser or changing settings.");
         println!("FPS 0 means unlimited. Monitor numbers are 1-based and match --list-monitors.");
         println!("--benchmark-cursor requires --benchmark and renders a synthetic GPU cursor for measurement.");
         println!("--benchmark-composition-cursor requires --benchmark and --dwm-composition; it moves only the proxy cursor over an eligible window for measurement.");
         println!("--benchmark-cursor selects a synthetic cursor shape. Without it, the system cursor shape is used.");
         println!("--benchmark-webex-cursor and --webex-controls|--no-webex-controls remain supported as legacy aliases.");
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--check-updates") {
+        let current = update::current_version();
+        match update::check_latest() {
+            Ok(latest) => println!("{}", update::cli_result_json(current, Ok(latest))),
+            Err(error) => {
+                println!("{}", update::cli_result_json(current, Err(&error)));
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
     unsafe {
@@ -363,6 +535,11 @@ pub fn run() -> windows::core::Result<()> {
             })
             .unwrap_or(false);
         WEBEX_CONTROLS.store(webex_controls, Ordering::Relaxed);
+        let check_updates_on_startup = loaded_settings
+            .as_ref()
+            .map(|settings| settings.check_updates_on_startup)
+            .unwrap_or(true);
+        CHECK_UPDATES_ON_STARTUP.store(check_updates_on_startup, Ordering::Relaxed);
         let benchmark_seconds = options.benchmark_seconds;
         let benchmark_cursor = options.benchmark_cursor;
         let report_path = options.report_path;
@@ -453,6 +630,27 @@ pub fn run() -> windows::core::Result<()> {
                 (MF_BYCOMMAND | MF_CHECKED).0,
             );
         }
+        let help_menu = CreatePopupMenu()?;
+        AppendMenuW(
+            help_menu,
+            MF_STRING,
+            CHECK_UPDATES_MENU,
+            w!("Check for updates..."),
+        )?;
+        AppendMenuW(
+            help_menu,
+            MF_STRING,
+            CHECK_UPDATES_STARTUP_MENU,
+            w!("Check on startup"),
+        )?;
+        if check_updates_on_startup {
+            CheckMenuItem(
+                help_menu,
+                CHECK_UPDATES_STARTUP_MENU as u32,
+                (MF_BYCOMMAND | MF_CHECKED).0,
+            );
+        }
+        AppendMenuW(menu, MF_POPUP, help_menu.0 as usize, w!("Help"))?;
         let _ = CheckMenuRadioItem(
             fps_menu,
             FPS_MENU_30 as u32,
@@ -614,11 +812,20 @@ pub fn run() -> windows::core::Result<()> {
         let mut proxy_create_timing = TimingStats::default();
         let mut webex_overlay_sync_at = Instant::now();
         let mut observed_webex_state_epoch = WEBEX_STATE_EPOCH.load(Ordering::Relaxed);
+        let mut update_ui = UpdateUi::default();
+        if benchmark_seconds.is_none() && check_updates_on_startup {
+            update_ui.start(CheckKind::Automatic);
+        }
 
         'main_loop: while !QUIT.load(Ordering::Relaxed) {
             if !pump_messages(&mut message) {
                 break;
             }
+            update_ui.poll();
+            if MANUAL_UPDATE_REQUESTED.swap(false, Ordering::AcqRel) {
+                update_ui.start(CheckKind::Manual);
+            }
+            present_update_if_ready(hwnd, &mut update_ui);
             let state_epoch = WEBEX_STATE_EPOCH.load(Ordering::Acquire);
             if state_epoch != observed_webex_state_epoch {
                 observed_webex_state_epoch = state_epoch;
@@ -1069,6 +1276,7 @@ pub fn run() -> windows::core::Result<()> {
                     fps: FPS_LIMIT.load(Ordering::Relaxed),
                     topmost: TOPMOST.load(Ordering::Relaxed),
                     webex_controls: WEBEX_CONTROLS.load(Ordering::Relaxed),
+                    check_updates_on_startup: CHECK_UPDATES_ON_STARTUP.load(Ordering::Relaxed),
                     window: WindowSettings {
                         left: WINDOW_LEFT.load(Ordering::Relaxed),
                         top: WINDOW_TOP.load(Ordering::Relaxed),
@@ -3784,6 +3992,19 @@ unsafe extern "system" fn window_proc(
                     let _ = unsafe { snapshot_webex_gui_flags() };
                     log_webex_ui_state("toggle");
                 }
+                CHECK_UPDATES_MENU => {
+                    MANUAL_UPDATE_REQUESTED.store(true, Ordering::Release);
+                }
+                CHECK_UPDATES_STARTUP_MENU => {
+                    let enabled = !CHECK_UPDATES_ON_STARTUP.load(Ordering::Relaxed);
+                    CHECK_UPDATES_ON_STARTUP.store(enabled, Ordering::Relaxed);
+                    SETTINGS_DIRTY.store(true, Ordering::Relaxed);
+                    let _ = CheckMenuItem(
+                        HMENU(GetMenu(hwnd).0),
+                        CHECK_UPDATES_STARTUP_MENU as u32,
+                        (MF_BYCOMMAND | if enabled { MF_CHECKED } else { MF_UNCHECKED }).0,
+                    );
+                }
                 _ => {}
             }
             if matches!(id, FPS_MENU_30 | FPS_MENU_60 | FPS_MENU_MAX) {
@@ -4920,6 +5141,35 @@ mod cursor_shader_tests {
         let options = parse_options(&benchmark, 1).unwrap();
         assert!(options.benchmark_cursor);
         assert_eq!(options.benchmark_seconds, Some(20));
+    }
+
+    #[test]
+    fn manual_check_joins_existing_request_instead_of_starting_another() {
+        let mut ui = UpdateUi {
+            active: Some(UpdateCheck::completed_for_test(
+                CheckKind::Automatic,
+                Ok(ReleaseInfo {
+                    version: update::Version(1, 2, 3),
+                }),
+            )),
+            pending: None,
+        };
+        ui.start(CheckKind::Manual);
+        ui.poll();
+        assert!(ui.active.is_none());
+        assert_eq!(
+            ui.pending.as_ref().map(|(kind, _)| *kind),
+            Some(CheckKind::Manual)
+        );
+    }
+
+    #[test]
+    fn check_updates_cli_option_parses_without_ui_options() {
+        let args = vec!["exmonitor-viewer".to_owned(), "--check-updates".to_owned()];
+        let options = parse_options(&args, 1).unwrap();
+        assert!(options.check_updates);
+        assert!(options.benchmark_seconds.is_none());
+        assert!(options.webex_controls.is_none());
     }
 
     #[test]

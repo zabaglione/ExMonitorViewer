@@ -12,6 +12,10 @@ Windows環境でRust、Windows SDK、Visual Studio C++ Build Toolsを用意し�
 
     .\dist\exmonitor-viewer.exe --help
 
+固定されたGitHub latest endpointを照会するheadlessコマンドです。UI、ブラウザー、設定ファイルには触れず、ASCII JSONを標準出力へ書きます。
+
+    .\target\release\exmonitor-viewer.exe --check-updates
+
 計測結果を書き出す例:
 
     .\dist\exmonitor-viewer.exe --monitor 2 --size 1920x1080 --benchmark 10 --report benchmark.txt

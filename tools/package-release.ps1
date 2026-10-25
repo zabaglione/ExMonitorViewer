@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$version = '0.1.5'
+$version = '0.1.6'
 $dist = Join-Path $root 'dist'
 $packageName = "ExMonitorViewer-v$version-windows-x64"
 $staging = Join-Path $dist $packageName
@@ -34,7 +34,7 @@ New-Item -ItemType Directory -Path $stagingFullPath | Out-Null
 Copy-Item -LiteralPath $executableSource -Destination (Join-Path $stagingFullPath 'exmonitor-viewer.exe')
 Copy-Item -LiteralPath (Join-Path $root 'README.md') -Destination $stagingFullPath
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stagingFullPath
-Copy-Item -LiteralPath (Join-Path $root 'docs\release-notes-v0.1.5.md') -Destination (Join-Path $stagingFullPath 'RELEASE-NOTES.md')
+Copy-Item -LiteralPath (Join-Path $root 'docs\release-notes-v0.1.6.md') -Destination (Join-Path $stagingFullPath 'RELEASE-NOTES.md')
 
 $checksums = Get-ChildItem -LiteralPath $stagingFullPath -File |
     Sort-Object Name |

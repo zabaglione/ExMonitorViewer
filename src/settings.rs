@@ -12,6 +12,8 @@ pub struct Settings {
     pub topmost: bool,
     #[serde(default, rename = "dwm_composition", alias = "webex_controls")]
     pub webex_controls: bool,
+    #[serde(default = "default_check_updates_on_startup")]
+    pub check_updates_on_startup: bool,
     pub window: WindowSettings,
 }
 
@@ -33,6 +35,7 @@ impl Default for Settings {
             fps: 60,
             topmost: false,
             webex_controls: false,
+            check_updates_on_startup: true,
             window: WindowSettings {
                 left: 100,
                 top: 100,
@@ -42,6 +45,10 @@ impl Default for Settings {
             },
         }
     }
+}
+
+fn default_check_updates_on_startup() -> bool {
+    true
 }
 
 impl Settings {
@@ -250,6 +257,24 @@ mod tests {
         let json = r#"{"schema_version":1,"monitor":null,"fps":60,"topmost":false,"window":{"left":100,"top":100,"width":1000,"height":600,"maximized":false}}"#;
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert!(!settings.webex_controls);
+        assert!(settings.check_updates_on_startup);
+    }
+
+    #[test]
+    fn startup_update_setting_defaults_on_for_old_files_and_preserves_off() {
+        let old = r#"{"schema_version":1,"monitor":null,"fps":60,"topmost":false,"window":{"left":100,"top":100,"width":1000,"height":600,"maximized":false}}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        assert!(settings.check_updates_on_startup);
+        let off = r#"{"schema_version":1,"monitor":null,"fps":60,"topmost":false,"check_updates_on_startup":false,"window":{"left":100,"top":100,"width":1000,"height":600,"maximized":false}}"#;
+        let settings: Settings = serde_json::from_str(off).unwrap();
+        assert!(!settings.check_updates_on_startup);
+        assert!(
+            !settings
+                .clone()
+                .validate()
+                .unwrap()
+                .check_updates_on_startup
+        );
     }
 
     #[test]
