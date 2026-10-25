@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$version = '0.1.0'
+$version = '0.1.1'
 $dist = Join-Path $root 'dist'
 $packageName = "ExMonitorViewer-v$version-windows-x64"
 $staging = Join-Path $dist $packageName

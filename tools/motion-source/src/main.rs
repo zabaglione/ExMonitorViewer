@@ -3,10 +3,11 @@ use std::ffi::c_void;
 use std::fs;
 use std::mem::size_of;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, BOOL, PCSTR, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_ENABLE_STRICTNESS};
 use windows::Win32::Graphics::Direct3D::{
     ID3DBlob, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_DRIVER_TYPE_UNKNOWN,
@@ -15,7 +16,7 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HMONITOR, MONITORINFOEXW,
+    EnumDisplayMonitors, GetMonitorInfoW, ScreenToClient, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -25,6 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const CLASS_NAME: PCWSTR = windows::core::w!("MotionSourceWindow");
 const WINDOW_TITLE: PCWSTR = windows::core::w!("Motion Source");
+static CURSOR_TEST: AtomicBool = AtomicBool::new(false);
 const SHADER: &[u8] = br#"
 cbuffer Params : register(b0) { float time; float width; float height; float pad; };
 struct VertexOut { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
@@ -38,6 +40,13 @@ VertexOut VSMain(uint id : SV_VertexID) {
 float4 PSMain(VertexOut input) : SV_TARGET {
     float2 uv = input.uv;
     float3 color = float3(0.021, 0.026, 0.038);
+    if (pad > 0.5) {
+        float band = min(min(uv.x, 1.0 - uv.x), min(abs(uv.x - 0.25), min(abs(uv.x - 0.5), abs(uv.x - 0.75))));
+        color = uv.x < 0.25 ? float3(0.035, 0.055, 0.075) :
+                (uv.x < 0.5 ? float3(0.055, 0.035, 0.070) :
+                (uv.x < 0.75 ? float3(0.070, 0.055, 0.025) : float3(0.035, 0.070, 0.040)));
+        if (band < 0.0015) color = float3(0.35, 0.4, 0.45);
+    }
     float lane = abs(uv.y - 0.5);
     if (lane < 0.0022) color = float3(0.16, 0.2, 0.24);
     float x = frac(time * 0.22);
@@ -61,6 +70,7 @@ struct Options {
     seconds: u64,
     report: Option<PathBuf>,
     list_monitors: bool,
+    cursor_test: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +111,7 @@ fn parse_options() -> Result<Options, String> {
     let mut seconds = 30u64;
     let mut report = None;
     let mut list_monitors = false;
+    let mut cursor_test = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -111,11 +122,13 @@ fn parse_options() -> Result<Options, String> {
             }
             "--report" => report = args.next().map(PathBuf::from),
             "--list-monitors" => list_monitors = true,
+            "--cursor-test" => cursor_test = true,
             "--help" | "-h" => {
                 println!(
-                    r"Usage: motion-source --display \\.\DISPLAY2 [--seconds 30] [--report path]"
+                    r"Usage: motion-source --display \\.\DISPLAY2 [--seconds 30] [--report path] [--cursor-test]"
                 );
                 println!("       motion-source --list-monitors");
+                println!("       --cursor-test divides the screen into Arrow, I-beam, Crosshair, and hidden cursor zones");
                 std::process::exit(0);
             }
             _ => return Err("unknown argument".into()),
@@ -131,6 +144,7 @@ fn parse_options() -> Result<Options, String> {
             seconds,
             report,
             list_monitors,
+            cursor_test,
         });
     }
     if display.is_empty() {
@@ -144,6 +158,7 @@ fn parse_options() -> Result<Options, String> {
         seconds,
         report,
         list_monitors,
+        cursor_test,
     })
 }
 
@@ -212,6 +227,38 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_SETCURSOR if CURSOR_TEST.load(Ordering::Relaxed) => {
+            let hit_test = (lparam.0 as u32 & 0xffff) as u16;
+            if hit_test == HTCLIENT as u16 {
+                let mut point = POINT::default();
+                if GetCursorPos(&mut point).is_ok() && ScreenToClient(hwnd, &mut point).as_bool() {
+                    let mut rect = RECT::default();
+                    if GetClientRect(hwnd, &mut rect).is_ok() {
+                        let width = rect.right - rect.left;
+                        if let Some(zone) = cursor_zone(point.x, width) {
+                            let cursor = match zone {
+                                0 => Some(IDC_ARROW),
+                                1 => Some(IDC_IBEAM),
+                                2 => Some(IDC_CROSS),
+                                _ => None,
+                            };
+                            match cursor {
+                                Some(id) => {
+                                    if let Ok(cursor) = LoadCursorW(None, id) {
+                                        let _ = SetCursor(Some(cursor));
+                                    }
+                                }
+                                None => {
+                                    let _ = SetCursor(None);
+                                }
+                            }
+                            return LRESULT(1);
+                        }
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
         WM_KEYDOWN if wparam.0 as u32 == 27 => {
             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             LRESULT(0)
@@ -222,6 +269,13 @@ unsafe extern "system" fn window_proc(
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
+}
+
+fn cursor_zone(x: i32, width: i32) -> Option<usize> {
+    if width <= 0 || x < 0 || x >= width {
+        return None;
+    }
+    Some(((x as i64 * 4) / width as i64) as usize)
 }
 
 fn create_window(bounds: MonitorBounds) -> Result<HWND, String> {
@@ -479,7 +533,7 @@ fn create_renderer(
 }
 
 impl Renderer {
-    fn render(&self, time: f32) -> Result<(), String> {
+    fn render(&self, time: f32, cursor_test: bool) -> Result<(), String> {
         unsafe {
             let targets = [Some(self.render_target.clone())];
             self.context.OMSetRenderTargets(Some(&targets), None);
@@ -493,7 +547,7 @@ impl Renderer {
                 time,
                 self.viewport_width as f32,
                 self.viewport_height as f32,
-                0.0,
+                f32::from(cursor_test),
             ];
             self.context.UpdateSubresource(
                 &self.constants,
@@ -514,6 +568,7 @@ impl Renderer {
 }
 
 fn run(options: &Options) -> Result<RunStats, String> {
+    CURSOR_TEST.store(options.cursor_test, Ordering::Relaxed);
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -551,7 +606,7 @@ fn run(options: &Options) -> Result<RunStats, String> {
             stats.elapsed = elapsed;
             break;
         }
-        renderer.render(elapsed.as_secs_f32())?;
+        renderer.render(elapsed.as_secs_f32(), options.cursor_test)?;
         stats.presents += 1;
         stats.elapsed = start.elapsed();
         if title_update.elapsed() >= Duration::from_millis(500) {
@@ -623,5 +678,27 @@ fn main() {
             eprintln!("ERROR: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_zone;
+
+    #[test]
+    fn cursor_zones_cover_equal_width_regions() {
+        assert_eq!(cursor_zone(0, 1920), Some(0));
+        assert_eq!(cursor_zone(479, 1920), Some(0));
+        assert_eq!(cursor_zone(480, 1920), Some(1));
+        assert_eq!(cursor_zone(960, 1920), Some(2));
+        assert_eq!(cursor_zone(1440, 1920), Some(3));
+        assert_eq!(cursor_zone(1919, 1920), Some(3));
+    }
+
+    #[test]
+    fn cursor_zone_rejects_points_outside_the_client_width() {
+        assert_eq!(cursor_zone(-1, 1920), None);
+        assert_eq!(cursor_zone(1920, 1920), None);
+        assert_eq!(cursor_zone(0, 0), None);
     }
 }
