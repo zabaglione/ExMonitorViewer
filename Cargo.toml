@@ -1,0 +1,40 @@
+[package]
+name = "exmonitor-viewer"
+version = "0.1.0"
+edition = "2021"
+description = "A GPU-accelerated Windows extended display viewer"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/zabaglione/ExMonitorViewer"
+keywords = ["windows", "dxgi", "desktop-duplication", "monitor", "gpu"]
+categories = ["multimedia::video", "graphics"]
+exclude = [
+  "/.tools/**",
+  "/target/**",
+  "/dist/**",
+  "/benchmark-*.txt",
+  "/tools/motion-source/target/**",
+]
+
+[dependencies]
+windows-core = "0.61.2"
+windows = { version = "0.61.3", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D_Fxc",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Console",
+  "Win32_System_Performance",
+  "Win32_UI_HiDpi",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

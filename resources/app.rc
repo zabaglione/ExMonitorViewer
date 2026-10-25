@@ -1,0 +1,32 @@
+#include <windows.h>
+
+#define IDI_APP 101
+IDI_APP ICON "..\\assets\\app-icon.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "ExMonitorViewer contributors\0"
+      VALUE "FileDescription", "GPU extended display viewer\0"
+      VALUE "FileVersion", "0.1.0.0\0"
+      VALUE "InternalName", "exmonitor-viewer\0"
+      VALUE "OriginalFilename", "exmonitor-viewer.exe\0"
+      VALUE "ProductName", "ExMonitorViewer\0"
+      VALUE "ProductVersion", "0.1.0\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

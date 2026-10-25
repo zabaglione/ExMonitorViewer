@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="tile" x1="36" y1="22" x2="472" y2="492" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0C2037"/>
+      <stop offset="1" stop-color="#061321"/>
+    </linearGradient>
+    <linearGradient id="rear-bezel" x1="72" y1="66" x2="407" y2="369" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1C5364"/>
+      <stop offset="1" stop-color="#12324B"/>
+    </linearGradient>
+    <linearGradient id="active-bar" x1="282" y1="331" x2="328" y2="366" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8DFFF1"/>
+      <stop offset="1" stop-color="#2CD7D5"/>
+    </linearGradient>
+    <clipPath id="tile-clip">
+      <rect x="12" y="12" width="488" height="488" rx="116"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#tile-clip)">
+    <rect x="12" y="12" width="488" height="488" rx="116" fill="url(#tile)"/>
+    <path d="M12 196C101 158 177 143 263 157C343 169 421 146 500 105V12H12V196Z" fill="#18354E" fill-opacity=".25"/>
+
+    <rect x="60" y="66" width="354" height="298" rx="30" fill="url(#rear-bezel)" stroke="#31C8CB" stroke-width="10"/>
+    <rect x="79" y="85" width="316" height="260" rx="18" fill="#091A2D" stroke="#315C72" stroke-width="4"/>
+    <rect x="101" y="108" width="112" height="14" rx="7" fill="#44E0D6"/>
+    <rect x="101" y="141" width="267" height="7" rx="3.5" fill="#285066"/>
+    <rect x="101" y="164" width="267" height="5" rx="2.5" fill="#1B394F"/>
+
+    <rect x="102" y="191" width="91" height="121" rx="12" fill="#102A41"/>
+    <rect x="117" y="207" width="49" height="8" rx="4" fill="#32788D"/>
+    <rect x="117" y="229" width="62" height="7" rx="3.5" fill="#24485E"/>
+    <rect x="117" y="247" width="48" height="7" rx="3.5" fill="#24485E"/>
+    <rect x="117" y="276" width="14" height="23" rx="5" fill="#25C7C9"/>
+    <rect x="138" y="260" width="14" height="39" rx="5" fill="#53E3D9"/>
+    <rect x="159" y="241" width="14" height="58" rx="5" fill="#268AA4"/>
+
+    <path d="M211 302L238 276L264 287L295 236L325 252L354 202L370 212" stroke="#3A9AAC" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" opacity=".8"/>
+    <circle cx="295" cy="236" r="6" fill="#73EFE5"/>
+
+    <rect x="64" y="364" width="345" height="14" rx="7" fill="#12364C"/>
+    <rect x="205" y="366" width="70" height="24" rx="11" fill="#174157"/>
+    <path d="M159 393H320C332 393 342 400 346 412H133C137 400 147 393 159 393Z" fill="#174157"/>
+
+    <rect x="175" y="216" width="294" height="244" rx="24" fill="#12304A" stroke="#7AF0E5" stroke-width="10"/>
+    <path d="M181 240C181 228.954 189.954 220 201 220H443C454.046 220 463 228.954 463 240V268H181V240Z" fill="#21445E"/>
+    <circle cx="204" cy="244" r="6" fill="#57E9DC"/>
+    <circle cx="225" cy="244" r="6" fill="#5B96A8"/>
+    <circle cx="246" cy="244" r="6" fill="#416A83"/>
+    <rect x="211" y="290" width="227" height="15" rx="7.5" fill="#193B54"/>
+    <rect x="211" y="335" width="227" height="18" rx="9" fill="#274E65"/>
+    <rect x="284" y="324" width="42" height="41" rx="14" fill="url(#active-bar)"/>
+    <rect x="211" y="384" width="108" height="9" rx="4.5" fill="#39738A"/>
+    <rect x="211" y="405" width="73" height="9" rx="4.5" fill="#28526A"/>
+    <circle cx="416" cy="390" r="8" fill="#47DED5"/>
+  </g>
+</svg>
