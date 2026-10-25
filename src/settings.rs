@@ -10,6 +10,8 @@ pub struct Settings {
     pub monitor: Option<String>,
     pub fps: u32,
     pub topmost: bool,
+    #[serde(default)]
+    pub webex_controls: bool,
     pub window: WindowSettings,
 }
 
@@ -30,6 +32,7 @@ impl Default for Settings {
             monitor: None,
             fps: 60,
             topmost: false,
+            webex_controls: false,
             window: WindowSettings {
                 left: 100,
                 top: 100,
@@ -240,5 +243,26 @@ mod tests {
         assert!(load(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{broken");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_without_webex_controls_default_to_disabled() {
+        let json = r#"{"schema_version":1,"monitor":null,"fps":60,"topmost":false,"window":{"left":100,"top":100,"width":1000,"height":600,"maximized":false}}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert!(!settings.webex_controls);
+    }
+
+    #[test]
+    fn webex_controls_setting_round_trips_as_enabled() {
+        let settings = Settings {
+            webex_controls: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            serde_json::from_str::<Settings>(&json)
+                .unwrap()
+                .webex_controls
+        );
     }
 }

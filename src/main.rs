@@ -3,6 +3,7 @@
 mod cursor;
 mod math;
 mod settings;
+mod win32_cursor;
 mod winapp;
 
 fn main() {

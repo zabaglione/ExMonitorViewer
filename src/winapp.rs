@@ -1,11 +1,15 @@
 use crate::cursor::{decode_shape, DecodedShape};
 use crate::settings::{self, Settings, WindowSettings};
+use crate::win32_cursor;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io::Write;
 use std::mem::size_of;
+use std::os::windows::ffi::OsStringExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use windows::core::{w, Error, HRESULT, PCSTR, PCWSTR};
+use windows::core::{w, Error, BOOL, HRESULT, PCSTR, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
 };
@@ -14,14 +18,26 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
+use windows::Win32::Graphics::Dwm::{
+    DwmGetWindowAttribute, DwmRegisterThumbnail, DwmUnregisterThumbnail,
+    DwmUpdateThumbnailProperties, DWMWA_CLOAKED, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_RECTDESTINATION,
+    DWM_TNP_RECTSOURCE, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+};
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTOPRIMARY,
+    ClientToScreen, GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, UpdateWindow,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows_core::Interface;
@@ -51,12 +67,25 @@ static ACTUAL_SCALE: AtomicU32 = AtomicU32::new(0);
 static WINDOW_CLOSE_LOGGED: AtomicBool = AtomicBool::new(false);
 static DISPLAY_CHANGED: AtomicBool = AtomicBool::new(false);
 static QUIT: AtomicBool = AtomicBool::new(false);
+static WEBEX_CONTROLS: AtomicBool = AtomicBool::new(false);
+static WEBEX_OVERLAYS_SUSPENDED: AtomicBool = AtomicBool::new(false);
+static WEBEX_STATE_EPOCH: AtomicU32 = AtomicU32::new(0);
+static WEBEX_MENU_ENTER_COUNT: AtomicU32 = AtomicU32::new(0);
+static WEBEX_MENU_EXIT_COUNT: AtomicU32 = AtomicU32::new(0);
+static WEBEX_MENU_TOGGLE_COUNT: AtomicU32 = AtomicU32::new(0);
+static WEBEX_MENU_GUI_FLAGS: AtomicU32 = AtomicU32::new(0);
+static WEBEX_MENU_RECHECK_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+static IN_SIZE_MOVE: AtomicBool = AtomicBool::new(false);
+static WEBEX_CURSOR_BENCHMARK: AtomicBool = AtomicBool::new(false);
+static WEBEX_CURSOR_BENCHMARK_STARTED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 const MONITOR_MENU_BASE: usize = 1000;
 const FPS_MENU_30: usize = 9001;
 const FPS_MENU_60: usize = 9002;
 const FPS_MENU_MAX: usize = 9003;
 const TOPMOST_MENU: usize = 9004;
+const WEBEX_CONTROLS_MENU: usize = 9005;
+const WM_APP_WEBEX_MENU_RECHECK: u32 = WM_APP + 0x42;
 const FIT_WINDOW_MENU: usize = 9010;
 const SCALE_MENU_BASE: usize = 9020;
 const SCALE_MENU_END: usize = SCALE_MENU_BASE + 6;
@@ -131,8 +160,10 @@ struct Options {
     size: Option<(u32, u32)>,
     benchmark_seconds: Option<u64>,
     benchmark_cursor: bool,
+    benchmark_webex_cursor: bool,
     report_path: Option<String>,
     settings_file: Option<String>,
+    webex_controls: Option<bool>,
 }
 
 fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result<Options> {
@@ -143,8 +174,10 @@ fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result
         size: None,
         benchmark_seconds: None,
         benchmark_cursor: false,
+        benchmark_webex_cursor: false,
         report_path: None,
         settings_file: None,
+        webex_controls: None,
     };
     let mut values = args.iter().skip(1);
     while let Some(argument) = values.next() {
@@ -188,6 +221,7 @@ fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result
                 options.benchmark_seconds = Some(seconds);
             }
             "--benchmark-cursor" => options.benchmark_cursor = true,
+            "--benchmark-webex-cursor" => options.benchmark_webex_cursor = true,
             "--report" => {
                 let path = values
                     .next()
@@ -202,10 +236,17 @@ fn parse_options(args: &[String], monitor_count: usize) -> windows::core::Result
                     .ok_or_else(invalid_arguments)?;
                 options.settings_file = Some(path.clone());
             }
+            "--webex-controls" => options.webex_controls = Some(true),
+            "--no-webex-controls" => options.webex_controls = Some(false),
             _ => return Err(invalid_arguments()),
         }
     }
     if options.benchmark_cursor && options.benchmark_seconds.is_none() {
+        return Err(invalid_arguments());
+    }
+    if options.benchmark_webex_cursor
+        && (options.benchmark_seconds.is_none() || options.webex_controls != Some(true))
+    {
         return Err(invalid_arguments());
     }
     Ok(options)
@@ -242,9 +283,11 @@ pub fn run() -> windows::core::Result<()> {
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("ExMonitorViewer - GPU extended-display window viewer");
-        println!("Usage: exmonitor-viewer [--list-monitors] [--monitor N] [--fps 30|60|0] [--size WIDTHxHEIGHT] [--settings-file PATH] [--benchmark SECONDS] [--report PATH]");
+        println!("Usage: exmonitor-viewer [--list-monitors] [--monitor N] [--fps 30|60|0] [--size WIDTHxHEIGHT] [--settings-file PATH] [--benchmark SECONDS] [--report PATH] [--webex-controls|--no-webex-controls]");
         println!("FPS 0 means unlimited. Monitor numbers are 1-based and match --list-monitors.");
         println!("--benchmark-cursor requires --benchmark and renders a synthetic GPU cursor for measurement.");
+        println!("--benchmark-webex-cursor requires --benchmark, --benchmark-cursor, and --webex-controls; it moves the synthetic cursor over a detected panel.");
+        println!("--webex-controls enables local-only Webex control thumbnails; --no-webex-controls disables them.");
         return Ok(());
     }
     unsafe {
@@ -258,6 +301,7 @@ pub fn run() -> windows::core::Result<()> {
         }
 
         let options = parse_options(&args, displays.len())?;
+        WEBEX_CURSOR_BENCHMARK.store(options.benchmark_webex_cursor, Ordering::Relaxed);
 
         if options.list_monitors {
             for (index, display) in displays.iter().enumerate() {
@@ -312,6 +356,15 @@ pub fn run() -> windows::core::Result<()> {
             .or_else(|| loaded_settings.as_ref().map(|s| s.fps))
             .unwrap_or(60);
         FPS_LIMIT.store(fps, Ordering::Relaxed);
+        let webex_controls = options
+            .webex_controls
+            .or_else(|| {
+                loaded_settings
+                    .as_ref()
+                    .map(|settings| settings.webex_controls)
+            })
+            .unwrap_or(false);
+        WEBEX_CONTROLS.store(webex_controls, Ordering::Relaxed);
         let benchmark_seconds = options.benchmark_seconds;
         let benchmark_cursor = options.benchmark_cursor;
         let report_path = options.report_path;
@@ -389,6 +442,19 @@ pub fn run() -> windows::core::Result<()> {
         )?;
         AppendMenuW(menu, MF_POPUP, scale_menu.0 as usize, w!("Scale"))?;
         AppendMenuW(menu, MF_STRING, TOPMOST_MENU, w!("Always on top"))?;
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            WEBEX_CONTROLS_MENU,
+            PCWSTR(webex_controls_menu_label(webex_controls).as_ptr()),
+        )?;
+        if webex_controls {
+            CheckMenuItem(
+                menu,
+                WEBEX_CONTROLS_MENU as u32,
+                (MF_BYCOMMAND | MF_CHECKED).0,
+            );
+        }
         let _ = CheckMenuRadioItem(
             fps_menu,
             FPS_MENU_30 as u32,
@@ -509,7 +575,10 @@ pub fn run() -> windows::core::Result<()> {
             Some(LPARAM(app_icon.0 as isize)),
         );
 
+        let mut renderer_startup_timing = TimingStats::default();
+        let renderer_started = Instant::now();
         let mut renderer = Renderer::new(&displays[current], hwnd, benchmark_cursor)?;
+        renderer_startup_timing.record(renderer_started);
         let (source_width, source_height) = renderer.logical_source_size();
         SOURCE_WIDTH.store(source_width, Ordering::Relaxed);
         SOURCE_HEIGHT.store(source_height, Ordering::Relaxed);
@@ -537,10 +606,33 @@ pub fn run() -> windows::core::Result<()> {
         let started = Instant::now();
         let mut present_ready = false;
         let mut occluded = false;
+        let mut webex_overlays = WebexOverlayManager::default();
+        let mut webex_cursor_proxy: Option<WebexCursorProxy> = None;
+        let mut proxy_errors = 0u64;
+        let mut proxy_error: Option<String> = None;
+        let mut proxy_retry_after = Instant::now();
+        let mut webex_sync_timing = TimingStats::default();
+        let mut renderer_timing = TimingStats::default();
+        let mut proxy_create_timing = TimingStats::default();
+        let mut webex_overlay_sync_at = Instant::now();
+        let mut observed_webex_state_epoch = WEBEX_STATE_EPOCH.load(Ordering::Relaxed);
 
         'main_loop: while !QUIT.load(Ordering::Relaxed) {
             if !pump_messages(&mut message) {
                 break;
+            }
+            let state_epoch = WEBEX_STATE_EPOCH.load(Ordering::Acquire);
+            if state_epoch != observed_webex_state_epoch {
+                observed_webex_state_epoch = state_epoch;
+                webex_cursor_proxy.take();
+                webex_overlays.clear();
+                webex_overlays.last_view_rect = None;
+                webex_overlays.geometry_changed_at = None;
+                webex_overlay_sync_at = Instant::now()
+                    .checked_sub(Duration::from_millis(150))
+                    .unwrap_or_else(Instant::now);
+                present_ready = true;
+                next_frame = Instant::now();
             }
             if benchmark_seconds
                 .is_some_and(|seconds| started.elapsed() >= Duration::from_secs(seconds))
@@ -548,10 +640,21 @@ pub fn run() -> windows::core::Result<()> {
                 break;
             }
 
+            if webex_overlay_sync_at.elapsed() >= Duration::from_millis(150) {
+                let sync_started = Instant::now();
+                webex_overlays.sync(hwnd, &renderer);
+                webex_sync_timing.record(sync_started);
+                webex_overlay_sync_at = Instant::now();
+            }
+
             let monitor_index = CURRENT_MONITOR.load(Ordering::Relaxed) as usize;
             let user_selected_monitor = monitor_index != renderer.monitor_index;
             let display_changed = DISPLAY_CHANGED.swap(false, Ordering::Relaxed);
             if user_selected_monitor || display_changed {
+                webex_cursor_proxy.take();
+                webex_overlays.clear();
+                webex_overlays.last_view_rect = None;
+                webex_overlays.geometry_changed_at = None;
                 renderer.release_held_frame().ok();
                 let old_name = renderer.monitor_name.clone();
                 renderer.context.ClearState();
@@ -569,7 +672,9 @@ pub fn run() -> windows::core::Result<()> {
                 };
                 let next = refreshed.get(next_index).ok_or_else(Error::from_win32)?;
                 CURRENT_MONITOR.store(next_index as u32, Ordering::Relaxed);
+                let renderer_started = Instant::now();
                 renderer = Renderer::new(next, hwnd, benchmark_cursor)?;
+                renderer_startup_timing.record(renderer_started);
                 let (source_width, source_height) = renderer.logical_source_size();
                 SOURCE_WIDTH.store(source_width, Ordering::Relaxed);
                 SOURCE_HEIGHT.store(source_height, Ordering::Relaxed);
@@ -587,6 +692,10 @@ pub fn run() -> windows::core::Result<()> {
             }
 
             if WINDOW_MINIMIZED.load(Ordering::Relaxed) {
+                if let Some(proxy) = webex_cursor_proxy.as_ref() {
+                    proxy.hide();
+                }
+                webex_overlays.clear();
                 renderer.release_held_frame().ok();
                 wait_for_messages(50);
                 continue;
@@ -658,6 +767,7 @@ pub fn run() -> windows::core::Result<()> {
                             "Capture reset {:#010X}; recreating renderer",
                             error.code().0 as u32
                         ));
+                        webex_cursor_proxy.take();
                         renderer.context.ClearState();
                         renderer.release_held_frame().ok();
                         renderer.context.Flush();
@@ -671,7 +781,9 @@ pub fn run() -> windows::core::Result<()> {
                             .unwrap_or(monitor_index.min(refreshed.len().saturating_sub(1)));
                         let next = refreshed.get(next_index).ok_or_else(Error::from_win32)?;
                         CURRENT_MONITOR.store(next_index as u32, Ordering::Relaxed);
+                        let renderer_started = Instant::now();
                         renderer = Renderer::new(next, hwnd, benchmark_cursor)?;
+                        renderer_startup_timing.record(renderer_started);
                         let (source_width, source_height) = renderer.logical_source_size();
                         SOURCE_WIDTH.store(source_width, Ordering::Relaxed);
                         SOURCE_HEIGHT.store(source_height, Ordering::Relaxed);
@@ -701,6 +813,7 @@ pub fn run() -> windows::core::Result<()> {
                     || CURRENT_MONITOR.load(Ordering::Relaxed) as usize != renderer.monitor_index
                     || RESIZE_WIDTH.load(Ordering::Relaxed) != renderer.window_width
                     || RESIZE_HEIGHT.load(Ordering::Relaxed) != renderer.window_height
+                    || WEBEX_STATE_EPOCH.load(Ordering::Acquire) != observed_webex_state_epoch
                 {
                     continue 'main_loop;
                 }
@@ -737,11 +850,14 @@ pub fn run() -> windows::core::Result<()> {
                     || CURRENT_MONITOR.load(Ordering::Relaxed) as usize != renderer.monitor_index
                     || RESIZE_WIDTH.load(Ordering::Relaxed) != renderer.window_width
                     || RESIZE_HEIGHT.load(Ordering::Relaxed) != renderer.window_height
+                    || WEBEX_STATE_EPOCH.load(Ordering::Acquire) != observed_webex_state_epoch
                 {
                     continue 'main_loop;
                 }
             }
+            let render_started = Instant::now();
             let render_result = renderer.render();
+            renderer_timing.record(render_started);
             if renderer.synthetic_position_updated {
                 total_synthetic_position_updates += 1;
             }
@@ -754,6 +870,52 @@ pub fn run() -> windows::core::Result<()> {
                     }
                     if renderer.fixture_cursor_intersects_display() {
                         total_fixture_visible_presents += 1;
+                    }
+                    if WEBEX_CONTROLS.load(Ordering::Relaxed) && !webex_overlays.entries.is_empty()
+                    {
+                        if webex_cursor_proxy.is_none() && Instant::now() >= proxy_retry_after {
+                            let create_started = Instant::now();
+                            match WebexCursorProxy::new(hwnd, &renderer, &webex_overlays) {
+                                Ok(proxy) => {
+                                    proxy_create_timing.record(create_started);
+                                    webex_cursor_proxy = Some(proxy);
+                                    proxy_error = None;
+                                }
+                                Err(error) => {
+                                    proxy_create_timing.record(create_started);
+                                    let message = format!(
+                                        "cursor proxy creation:{:#010x}",
+                                        error.code().0 as u32
+                                    );
+                                    if proxy_error.as_deref() != Some(message.as_str()) {
+                                        log(&format!("WARNING: Webex cursor proxy: {message}"));
+                                        proxy_errors += 1;
+                                    }
+                                    proxy_error = Some(message);
+                                    proxy_retry_after = Instant::now() + Duration::from_secs(3);
+                                }
+                            }
+                        }
+                        if let Some(proxy) = webex_cursor_proxy.as_mut() {
+                            match proxy.draw(hwnd, &mut renderer, &webex_overlays) {
+                                Ok(_) => proxy_error = None,
+                                Err(error) => {
+                                    let message = format!(
+                                        "cursor proxy draw:{:#010x}",
+                                        error.code().0 as u32
+                                    );
+                                    if proxy_error.as_deref() != Some(message.as_str()) {
+                                        log(&format!("WARNING: Webex cursor proxy: {message}"));
+                                        proxy_errors += 1;
+                                    }
+                                    proxy_error = Some(message);
+                                    webex_cursor_proxy.take();
+                                    proxy_retry_after = Instant::now() + Duration::from_secs(3);
+                                }
+                            }
+                        }
+                    } else if let Some(proxy) = webex_cursor_proxy.as_ref() {
+                        proxy.hide();
                     }
                 }
                 Ok(false) => {
@@ -796,20 +958,93 @@ pub fn run() -> windows::core::Result<()> {
                 SetWindowTextW(hwnd, PCWSTR(title.as_ptr()))?;
             }
         }
+        let webex_overlay_count = webex_overlays.entries.len();
+        let webex_overlay_max_count = webex_overlays.max_count;
+        let webex_overlay_refreshes = webex_overlays.refreshes;
+        let webex_overlay_errors = webex_overlays.errors;
+        let proxy_submits = webex_cursor_proxy.as_ref().map_or(0, |proxy| proxy.submits);
+        let proxy_visible_submits = webex_cursor_proxy
+            .as_ref()
+            .map_or(0, |proxy| proxy.visible_submits);
+        let proxy_mode1_submits = webex_cursor_proxy
+            .as_ref()
+            .map_or(0, |proxy| proxy.mode1_submits);
+        let proxy_mode2_submits = webex_cursor_proxy
+            .as_ref()
+            .map_or(0, |proxy| proxy.mode2_submits);
+        let proxy_position_timing = webex_cursor_proxy
+            .as_ref()
+            .map_or(TimingStats::default(), |proxy| proxy.position_timing);
+        let proxy_visibility_timing = webex_cursor_proxy
+            .as_ref()
+            .map_or(TimingStats::default(), |proxy| proxy.visibility_timing);
+        let proxy_z_order_timing = webex_cursor_proxy
+            .as_ref()
+            .map_or(TimingStats::default(), |proxy| proxy.z_order_timing);
+        let proxy_draw_timing = webex_cursor_proxy
+            .as_ref()
+            .map_or(TimingStats::default(), |proxy| proxy.draw_timing);
+        let proxy_present_timing = webex_cursor_proxy
+            .as_ref()
+            .map_or(TimingStats::default(), |proxy| proxy.present_timing);
+        let proxy_offset_timing = webex_cursor_proxy
+            .as_ref()
+            .map_or(TimingStats::default(), |proxy| proxy.offset_timing);
+        let proxy_commit_timing = webex_cursor_proxy
+            .as_ref()
+            .map_or(TimingStats::default(), |proxy| proxy.commit_timing);
+        let webex_controls_enabled = WEBEX_CONTROLS.load(Ordering::Relaxed);
+        webex_overlays.clear();
+        webex_cursor_proxy.take();
         renderer.release_held_frame().ok();
         if let Some(path) =
             report_path.or_else(|| benchmark_seconds.map(|_| "benchmark-report.txt".to_owned()))
         {
             let elapsed = started.elapsed().as_secs_f64().max(0.001);
             let report = format!(
-                "monitor={}\ncapture_resolution={}x{}\nclient_resolution={}x{}\nbenchmark_seconds={:.3}\ncapture_fps={:.3}\npresent_submit_fps={:.3}\ncaptured_frames={}\npresent_submits={}\npointer_updates={}\ncursor_shape_uploads={}\ncursor_visible_present_submits={}\nfixture_shape_uploads={}\nfixture_position_updates={}\nfixture_visible_present_submits={}\ncursor_source={}\n",
+                "monitor={}\ncapture_resolution={}x{}\nclient_resolution={}x{}\nbenchmark_seconds={:.3}\ncapture_fps={:.3}\npresent_submit_fps={:.3}\ncaptured_frames={}\npresent_submits={}\npointer_updates={}\ncursor_shape_uploads={}\ncursor_visible_present_submits={}\nfixture_shape_uploads={}\nfixture_position_updates={}\nfixture_visible_present_submits={}\ncursor_source={}\nfixture_path={}\nproxy_tint={}\nproxy_shape_source={}\nproxy_position_source={}\nwebex_controls_enabled={}\nwebex_state_epoch={}\nwebex_menu_enter_count={}\nwebex_menu_exit_count={}\nwebex_menu_toggle_count={}\nwebex_menu_gui_flags={:08X}\nwebex_overlays_suspended={}\nwebex_overlay_count_at_end={}\nwebex_overlay_max_count={}\nwebex_overlay_refreshes={}\nwebex_overlay_errors={}\nproxy_present_submits={}\nproxy_visible_submits={}\nproxy_mode1_submits={}\nproxy_mode2_submits={}\nproxy_errors={}\nwebex_sync_total_ms={:.3}\nwebex_sync_max_ms={:.3}\nwebex_sync_samples={}\nmain_render_total_ms={:.3}\nmain_render_max_ms={:.3}\nmain_render_samples={}\nproxy_create_total_ms={:.3}\nproxy_create_max_ms={:.3}\nproxy_create_samples={}\nproxy_position_total_ms={:.3}\nproxy_position_max_ms={:.3}\nproxy_position_samples={}\nproxy_visibility_total_ms={:.3}\nproxy_visibility_max_ms={:.3}\nproxy_visibility_samples={}\nproxy_z_order_total_ms={:.3}\nproxy_z_order_max_ms={:.3}\nproxy_z_order_samples={}\nproxy_draw_total_ms={:.3}\nproxy_draw_max_ms={:.3}\nproxy_draw_samples={}\nproxy_present_total_ms={:.3}\nproxy_present_max_ms={:.3}\nproxy_present_timing_samples={}\n",
                 ascii(&renderer.monitor_name), renderer.source_width, renderer.source_height,
                 renderer.window_width, renderer.window_height,
                 elapsed, total_captured as f64 / elapsed, total_presented as f64 / elapsed,
                 total_captured, total_presented, total_pointer_updates, total_shape_uploads,
                 total_cursor_visible_presents, total_fixture_shape_uploads,
                 total_synthetic_position_updates, total_fixture_visible_presents,
-                if benchmark_cursor { "synthetic_benchmark" } else { "dxgi" }
+                if benchmark_cursor { "synthetic_benchmark" } else { "dxgi" },
+                if options.benchmark_webex_cursor { "webex_panel" } else { "default" },
+                if options.benchmark_webex_cursor { "magenta" } else { "none" },
+                if options.benchmark_webex_cursor && benchmark_cursor { "synthetic_fixture" } else { "system_hcursor" },
+                if options.benchmark_webex_cursor { "diagnostic_panel_position" } else { "system_cursor_position" },
+                webex_controls_enabled,
+                WEBEX_STATE_EPOCH.load(Ordering::Relaxed),
+                WEBEX_MENU_ENTER_COUNT.load(Ordering::Relaxed),
+                WEBEX_MENU_EXIT_COUNT.load(Ordering::Relaxed),
+                WEBEX_MENU_TOGGLE_COUNT.load(Ordering::Relaxed),
+                WEBEX_MENU_GUI_FLAGS.load(Ordering::Relaxed),
+                u32::from(WEBEX_OVERLAYS_SUSPENDED.load(Ordering::Relaxed)),
+                webex_overlay_count,
+                webex_overlay_max_count,
+                webex_overlay_refreshes, webex_overlay_errors, proxy_submits,
+                proxy_visible_submits, proxy_mode1_submits, proxy_mode2_submits, proxy_errors,
+                webex_sync_timing.total_ms, webex_sync_timing.max_ms, webex_sync_timing.samples,
+                renderer_timing.total_ms, renderer_timing.max_ms, renderer_timing.samples,
+                proxy_create_timing.total_ms, proxy_create_timing.max_ms, proxy_create_timing.samples,
+                proxy_position_timing.total_ms, proxy_position_timing.max_ms, proxy_position_timing.samples,
+                proxy_visibility_timing.total_ms, proxy_visibility_timing.max_ms, proxy_visibility_timing.samples,
+                proxy_z_order_timing.total_ms, proxy_z_order_timing.max_ms, proxy_z_order_timing.samples,
+                proxy_draw_timing.total_ms, proxy_draw_timing.max_ms, proxy_draw_timing.samples,
+                proxy_present_timing.total_ms, proxy_present_timing.max_ms, proxy_present_timing.samples
+            );
+            let report = format!(
+                "{report}renderer_startup_total_ms={:.3}\nrenderer_startup_max_ms={:.3}\nrenderer_startup_samples={}\nproxy_visual_offset_total_ms={:.3}\nproxy_visual_offset_max_ms={:.3}\nproxy_visual_offset_samples={}\nproxy_commit_total_ms={:.3}\nproxy_commit_max_ms={:.3}\nproxy_commit_samples={}\n",
+                renderer_startup_timing.total_ms,
+                renderer_startup_timing.max_ms,
+                renderer_startup_timing.samples,
+                proxy_offset_timing.total_ms,
+                proxy_offset_timing.max_ms,
+                proxy_offset_timing.samples,
+                proxy_commit_timing.total_ms,
+                proxy_commit_timing.max_ms,
+                proxy_commit_timing.samples
             );
             std::fs::write(path, report)?;
         }
@@ -835,6 +1070,7 @@ pub fn run() -> windows::core::Result<()> {
                     monitor: Some(selected_monitor),
                     fps: FPS_LIMIT.load(Ordering::Relaxed),
                     topmost: TOPMOST.load(Ordering::Relaxed),
+                    webex_controls: WEBEX_CONTROLS.load(Ordering::Relaxed),
                     window: WindowSettings {
                         left: WINDOW_LEFT.load(Ordering::Relaxed),
                         top: WINDOW_TOP.load(Ordering::Relaxed),
@@ -854,6 +1090,73 @@ pub fn run() -> windows::core::Result<()> {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn invalidate_webex_state() {
+    WEBEX_STATE_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
+unsafe fn snapshot_webex_gui_flags() -> Option<u32> {
+    let mut info = GUITHREADINFO {
+        cbSize: size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetGUIThreadInfo(GetCurrentThreadId(), &mut info) }.is_err() {
+        WEBEX_MENU_GUI_FLAGS.store(u32::MAX, Ordering::Relaxed);
+        return None;
+    }
+    WEBEX_MENU_GUI_FLAGS.store(info.flags.0, Ordering::Relaxed);
+    Some(info.flags.0)
+}
+
+unsafe fn post_webex_menu_recheck(hwnd: HWND, reset_attempts: bool) {
+    if reset_attempts {
+        WEBEX_MENU_RECHECK_ATTEMPTS.store(0, Ordering::Relaxed);
+    }
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_WEBEX_MENU_RECHECK, WPARAM(0), LPARAM(0)) };
+}
+
+fn log_webex_ui_state(event: &str) {
+    log(&format!(
+        "Webex UI event={event} enabled={} suspended={} epoch={} menu_enter={} menu_exit={} menu_toggle={} gui_flags={:08X}",
+        u32::from(WEBEX_CONTROLS.load(Ordering::Relaxed)),
+        u32::from(WEBEX_OVERLAYS_SUSPENDED.load(Ordering::Relaxed)),
+        WEBEX_STATE_EPOCH.load(Ordering::Relaxed),
+        WEBEX_MENU_ENTER_COUNT.load(Ordering::Relaxed),
+        WEBEX_MENU_EXIT_COUNT.load(Ordering::Relaxed),
+        WEBEX_MENU_TOGGLE_COUNT.load(Ordering::Relaxed),
+        WEBEX_MENU_GUI_FLAGS.load(Ordering::Relaxed),
+    ));
+}
+
+fn webex_controls_menu_label(enabled: bool) -> Vec<u16> {
+    wide(&format!(
+        "DWM composition: {}",
+        if enabled { "ON" } else { "OFF" }
+    ))
+}
+
+unsafe fn hide_owned_webex_overlays(owner: HWND) {
+    let _ = EnumThreadWindows(
+        GetCurrentThreadId(),
+        Some(hide_owned_webex_overlay_window),
+        LPARAM(owner.0 as isize),
+    );
+}
+
+unsafe extern "system" fn hide_owned_webex_overlay_window(hwnd: HWND, owner_param: LPARAM) -> BOOL {
+    let owner = HWND(owner_param.0 as *mut c_void);
+    if GetWindow(hwnd, GW_OWNER).is_ok_and(|candidate| candidate == owner) {
+        let mut class_name = [0u16; 64];
+        let length = GetClassNameW(hwnd, &mut class_name);
+        if length > 0
+            && String::from_utf16_lossy(&class_name[..length as usize])
+                == "ExMonitorViewerWebexOverlay"
+        {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+    BOOL(1)
 }
 
 fn ascii(value: &str) -> String {
@@ -931,6 +1234,1295 @@ struct Display {
     output: IDXGIOutput,
     adapter: IDXGIAdapter1,
     factory: IDXGIFactory1,
+}
+
+#[derive(Clone, Copy)]
+struct WebexWindow {
+    hwnd: HWND,
+    pid: u32,
+    rect: RECT,
+    z_order: usize,
+}
+
+struct WebexWindowScan {
+    monitor: RECT,
+    windows: Vec<WebexWindow>,
+    process_paths: HashMap<u32, String>,
+}
+
+struct WebexOverlay {
+    thumbnail: isize,
+    window: HWND,
+    source_rect: RECT,
+    destination_rect: RECT,
+    z_order: usize,
+}
+
+#[derive(Default)]
+struct WebexOverlayManager {
+    entries: HashMap<(isize, u32), WebexOverlay>,
+    class_registered: bool,
+    last_view_rect: Option<RECT>,
+    geometry_changed_at: Option<Instant>,
+    last_z_order_check: Option<Instant>,
+    z_order_retry_after: Option<Instant>,
+    last_error: Option<String>,
+    refreshes: u64,
+    max_count: u32,
+    errors: u64,
+}
+
+const MAX_WEBEX_OVERLAYS: usize = 32;
+const CURSOR_PROXY_CLIP_CAPACITY: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CursorProxyConstants {
+    cursor_size: [f32; 2],
+    output_size: [f32; 2],
+    mode: u32,
+    clip_count: u32,
+    diagnostic_tint: u32,
+    reserved: u32,
+    padding: [f32; 2],
+    alignment: [f32; 2],
+    clips: [[f32; 4]; CURSOR_PROXY_CLIP_CAPACITY],
+}
+
+struct WebexCursorProxy {
+    hwnd: HWND,
+    swapchain: IDXGISwapChain1,
+    composition: IDCompositionDevice,
+    latency_device: IDXGIDevice1,
+    _target: IDCompositionTarget,
+    visual: IDCompositionVisual,
+    target_view: Option<ID3D11RenderTargetView>,
+    vertex_shader: ID3D11VertexShader,
+    pixel_shader: ID3D11PixelShader,
+    constants: ID3D11Buffer,
+    size: (u32, u32),
+    submits: u64,
+    visible_submits: u64,
+    mode1_submits: u64,
+    mode2_submits: u64,
+    last_z_check: Instant,
+    position_timing: TimingStats,
+    visibility_timing: TimingStats,
+    z_order_timing: TimingStats,
+    draw_timing: TimingStats,
+    present_timing: TimingStats,
+    commit_timing: TimingStats,
+    offset_timing: TimingStats,
+    host_rect: RECT,
+    visual_offset: Option<(i32, i32)>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TimingStats {
+    total_ms: f64,
+    max_ms: f64,
+    samples: u64,
+}
+
+impl TimingStats {
+    fn record(&mut self, started: Instant) {
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.total_ms += elapsed_ms;
+        self.max_ms = self.max_ms.max(elapsed_ms);
+        self.samples += 1;
+    }
+}
+
+impl WebexCursorProxy {
+    unsafe fn new(
+        owner: HWND,
+        renderer: &Renderer,
+        overlays: &WebexOverlayManager,
+    ) -> windows::core::Result<Self> {
+        let host_rect = webex_overlay_union_rect(overlays).ok_or_else(Error::from_win32)?;
+        let host_width = host_rect.right - host_rect.left;
+        let host_height = host_rect.bottom - host_rect.top;
+        let hwnd = CreateWindowExW(
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP,
+            w!("ExMonitorViewerWebexOverlay"),
+            w!(""),
+            WS_POPUP,
+            host_rect.left,
+            host_rect.top,
+            host_width,
+            host_height,
+            Some(owner),
+            None,
+            Some(GetModuleHandleW(None)?.into()),
+            None,
+        )?;
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = UpdateWindow(hwnd);
+        }
+        let affinity = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).and_then(|_| {
+            let mut value = 0u32;
+            GetWindowDisplayAffinity(hwnd, &mut value)?;
+            if value == 0x11 {
+                Ok(())
+            } else {
+                Err(Error::from_win32())
+            }
+        });
+        if let Err(error) = affinity {
+            let _ = DestroyWindow(hwnd);
+            return Err(error);
+        }
+
+        let result = (|| {
+            let dxgi_device: IDXGIDevice = renderer.device.cast()?;
+            let composition: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
+            let target = composition.CreateTargetForHwnd(hwnd, false)?;
+            let visual = composition.CreateVisual()?;
+            let factory: IDXGIFactory2 = renderer.swapchain.GetParent()?;
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: 16,
+                Height: 16,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                Stereo: false.into(),
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                Flags: 0,
+            };
+            let swapchain = factory.CreateSwapChainForComposition(&renderer.device, &desc, None)?;
+            visual.SetContent(&swapchain)?;
+            target.SetRoot(&visual)?;
+            composition.Commit()?;
+            let target_view = make_target_view(&renderer.device, &swapchain)?;
+            let buffer = D3D11_BUFFER_DESC {
+                ByteWidth: size_of::<CursorProxyConstants>() as u32,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+                StructureByteStride: 0,
+            };
+            let mut constants = None;
+            renderer
+                .device
+                .CreateBuffer(&buffer, None, Some(&mut constants))?;
+            Ok::<_, Error>((
+                composition,
+                target,
+                visual,
+                swapchain,
+                target_view,
+                renderer.cursor_proxy_vertex_shader.clone(),
+                renderer.cursor_proxy_pixel_shader.clone(),
+                constants.ok_or_else(Error::from_win32)?,
+            ))
+        })();
+        match result {
+            Ok((
+                composition,
+                target,
+                visual,
+                swapchain,
+                target_view,
+                vertex_shader,
+                pixel_shader,
+                constants,
+            )) => {
+                let latency_device = match renderer.device.cast::<IDXGIDevice1>() {
+                    Ok(device) => device,
+                    Err(error) => {
+                        let _ = DestroyWindow(hwnd);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = latency_device.SetMaximumFrameLatency(2) {
+                    let _ = DestroyWindow(hwnd);
+                    return Err(error);
+                }
+                Ok(Self {
+                    hwnd,
+                    swapchain,
+                    composition,
+                    latency_device,
+                    _target: target,
+                    visual,
+                    target_view: Some(target_view),
+                    vertex_shader,
+                    pixel_shader,
+                    constants,
+                    size: (16, 16),
+                    submits: 0,
+                    visible_submits: 0,
+                    mode1_submits: 0,
+                    mode2_submits: 0,
+                    last_z_check: Instant::now()
+                        .checked_sub(Duration::from_secs(1))
+                        .unwrap_or_else(Instant::now),
+                    position_timing: TimingStats::default(),
+                    visibility_timing: TimingStats::default(),
+                    z_order_timing: TimingStats::default(),
+                    draw_timing: TimingStats::default(),
+                    present_timing: TimingStats::default(),
+                    commit_timing: TimingStats::default(),
+                    offset_timing: TimingStats::default(),
+                    host_rect,
+                    visual_offset: None,
+                })
+            }
+            Err(error) => {
+                let _ = DestroyWindow(hwnd);
+                Err(error)
+            }
+        }
+    }
+
+    fn hide(&self) {
+        unsafe {
+            if IsWindowVisible(self.hwnd).as_bool() {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+        }
+    }
+
+    unsafe fn draw(
+        &mut self,
+        owner: HWND,
+        renderer: &mut Renderer,
+        overlays: &WebexOverlayManager,
+    ) -> windows::core::Result<bool> {
+        if !renderer.has_frame || overlays.entries.is_empty() {
+            self.hide();
+            return Ok(false);
+        }
+        let diagnostic_panel_position = WEBEX_CURSOR_BENCHMARK.load(Ordering::Relaxed);
+        let synthetic_proxy_cursor = diagnostic_panel_position && renderer.synthetic_cursor;
+        let (shape, cursor_position, cursor_view) = if synthetic_proxy_cursor {
+            let Some(shape) = renderer.active_cursor_shape() else {
+                self.hide();
+                return Ok(false);
+            };
+            (
+                shape,
+                renderer.active_cursor_position(),
+                renderer.active_cursor_view(),
+            )
+        } else {
+            unsafe { renderer.update_proxy_cursor() };
+            if !renderer.proxy_cursor_visible {
+                self.hide();
+                return Ok(false);
+            }
+            let Some(shape) = renderer.proxy_cursor_shape else {
+                self.hide();
+                return Ok(false);
+            };
+            let cursor_bounds = win32_cursor::cursor_bounds(
+                renderer.proxy_cursor_screen_position,
+                renderer.proxy_cursor_hotspot,
+                shape,
+            );
+            let (logical_width, logical_height) = renderer.logical_source_size();
+            let width_scale = logical_width as f64 / renderer.monitor_width.max(1) as f64;
+            let height_scale = logical_height as f64 / renderer.monitor_height.max(1) as f64;
+            let position = [
+                ((cursor_bounds.left - renderer.monitor_left) as f64 * width_scale).round() as i32,
+                ((cursor_bounds.top - renderer.monitor_top) as f64 * height_scale).round() as i32,
+            ];
+            (shape, position, renderer.proxy_cursor_view.clone())
+        };
+        let Some(cursor_view) = cursor_view else {
+            self.hide();
+            return Ok(false);
+        };
+        let fit = renderer.fit_display_rect();
+        let (logical_width, logical_height) = renderer.logical_source_size();
+        if logical_width == 0 || logical_height == 0 || fit.width <= 0.0 || fit.height <= 0.0 {
+            self.hide();
+            return Ok(false);
+        }
+        let mut origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+        if !unsafe { ClientToScreen(owner, &mut origin) }.as_bool() {
+            self.hide();
+            return Ok(false);
+        }
+        let scale_x = fit.width / logical_width as f32;
+        let scale_y = fit.height / logical_height as f32;
+        let scale = scale_x.min(scale_y);
+        if !scale.is_finite() || scale <= 0.0 {
+            self.hide();
+            return Ok(false);
+        }
+        let mut cursor_position = cursor_position;
+        if diagnostic_panel_position {
+            if let Some(panel) = overlays.entries.values().next() {
+                let panel_left = panel
+                    .destination_rect
+                    .left
+                    .max(origin.x + fit.x.round() as i32);
+                let panel_top = panel
+                    .destination_rect
+                    .top
+                    .max(origin.y + fit.y.round() as i32);
+                let panel_right = panel
+                    .destination_rect
+                    .right
+                    .min(origin.x + (fit.x + fit.width).round() as i32);
+                let panel_bottom = panel
+                    .destination_rect
+                    .bottom
+                    .min(origin.y + (fit.y + fit.height).round() as i32);
+                if panel_right > panel_left && panel_bottom > panel_top {
+                    let started = WEBEX_CURSOR_BENCHMARK_STARTED.get_or_init(Instant::now);
+                    let t = started.elapsed().as_secs_f32();
+                    let px = panel_left
+                        + (((t * 0.91).sin() * 0.5 + 0.5) * (panel_right - panel_left) as f32)
+                            as i32;
+                    let py = panel_top
+                        + (((t * 0.73).cos() * 0.5 + 0.5) * (panel_bottom - panel_top) as f32)
+                            as i32;
+                    cursor_position = [
+                        ((px - origin.x - fit.x.round() as i32) as f32 / scale).round() as i32,
+                        ((py - origin.y - fit.y.round() as i32) as f32 / scale).round() as i32,
+                    ];
+                }
+            }
+        }
+        let draw_width = (shape.width as f32 * scale).ceil().max(1.0) as i32;
+        let draw_height = (shape.height as f32 * scale).ceil().max(1.0) as i32;
+        let padding = 2;
+        let window_width = draw_width + padding * 2;
+        let window_height = draw_height + padding * 2;
+        let left =
+            origin.x + fit.x.round() as i32 + (cursor_position[0] as f32 * scale).round() as i32
+                - padding;
+        let top =
+            origin.y + fit.y.round() as i32 + (cursor_position[1] as f32 * scale).round() as i32
+                - padding;
+        let mut constants = CursorProxyConstants {
+            cursor_size: [shape.width as f32, shape.height as f32],
+            output_size: [draw_width as f32, draw_height as f32],
+            mode: shape.mode,
+            clip_count: 0,
+            diagnostic_tint: u32::from(diagnostic_panel_position),
+            reserved: 0,
+            padding: [padding as f32, padding as f32],
+            alignment: [0.0; 2],
+            clips: [[0.0; 4]; CURSOR_PROXY_CLIP_CAPACITY],
+        };
+        for entry in overlays.entries.values() {
+            if let Some(clipped) = intersect_rect(
+                entry.destination_rect,
+                RECT {
+                    left,
+                    top,
+                    right: left + window_width,
+                    bottom: top + window_height,
+                },
+            ) {
+                if constants.clip_count as usize == CURSOR_PROXY_CLIP_CAPACITY {
+                    break;
+                }
+                let i = constants.clip_count as usize;
+                constants.clips[i] = [
+                    (clipped.left - left) as f32,
+                    (clipped.top - top) as f32,
+                    (clipped.right - left) as f32,
+                    (clipped.bottom - top) as f32,
+                ];
+                constants.clip_count += 1;
+            }
+        }
+        if constants.clip_count == 0 {
+            self.hide();
+            return Ok(false);
+        }
+        let host_rect = webex_overlay_union_rect(overlays).ok_or_else(Error::from_win32)?;
+        if !same_rect(self.host_rect, host_rect) {
+            let started = Instant::now();
+            SetWindowPos(
+                self.hwnd,
+                None,
+                host_rect.left,
+                host_rect.top,
+                host_rect.right - host_rect.left,
+                host_rect.bottom - host_rect.top,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+            )?;
+            self.position_timing.record(started);
+            self.host_rect = host_rect;
+            self.visual_offset = None;
+            self.last_z_check = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+        }
+        let new_size = (window_width as u32, window_height as u32);
+        if new_size != self.size {
+            renderer
+                .context
+                .OMSetRenderTargets(None, None::<&ID3D11DepthStencilView>);
+            self.target_view = None;
+            self.swapchain.ResizeBuffers(
+                0,
+                new_size.0,
+                new_size.1,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            )?;
+            self.target_view = Some(make_target_view(&renderer.device, &self.swapchain)?);
+            self.size = new_size;
+        }
+        let offset = (left - self.host_rect.left, top - self.host_rect.top);
+        if self.visual_offset != Some(offset) {
+            let offset_started = Instant::now();
+            self.visual.SetOffsetX2(offset.0 as f32)?;
+            self.visual.SetOffsetY2(offset.1 as f32)?;
+            self.offset_timing.record(offset_started);
+            let commit_started = Instant::now();
+            self.composition.Commit()?;
+            self.commit_timing.record(commit_started);
+            self.visual_offset = Some(offset);
+        }
+        let draw_started = Instant::now();
+        renderer.context.UpdateSubresource(
+            &self.constants,
+            0,
+            None,
+            &constants as *const CursorProxyConstants as *const c_void,
+            0,
+            0,
+        );
+        let target_view = self.target_view.as_ref().ok_or_else(Error::from_win32)?;
+        renderer
+            .context
+            .OMSetRenderTargets(Some(&[Some(target_view.clone())]), None);
+        renderer.context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: new_size.0 as f32,
+            Height: new_size.1 as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]));
+        renderer
+            .context
+            .ClearRenderTargetView(target_view, &[0.0; 4]);
+        renderer
+            .context
+            .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        renderer.context.VSSetShader(&self.vertex_shader, None);
+        renderer.context.PSSetShader(&self.pixel_shader, None);
+        renderer
+            .context
+            .PSSetShaderResources(0, Some(&[Some(cursor_view)]));
+        renderer
+            .context
+            .PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
+        renderer.context.Draw(3, 0);
+        renderer.context.PSSetShaderResources(0, Some(&[None]));
+        renderer
+            .context
+            .OMSetRenderTargets(None, None::<&ID3D11DepthStencilView>);
+        self.draw_timing.record(draw_started);
+        let present_started = Instant::now();
+        self.swapchain.Present(0, DXGI_PRESENT(0)).ok()?;
+        self.present_timing.record(present_started);
+        unsafe {
+            if !IsWindowVisible(self.hwnd).as_bool() {
+                let visibility_started = Instant::now();
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                self.visibility_timing.record(visibility_started);
+            }
+            if self.last_z_check.elapsed() >= Duration::from_millis(150) {
+                let z_order_started = Instant::now();
+                ensure_proxy_above_panels(self.hwnd, overlays)?;
+                self.z_order_timing.record(z_order_started);
+                self.last_z_check = Instant::now();
+            }
+        }
+        self.submits += 1;
+        self.visible_submits += 1;
+        if shape.mode == 1 {
+            self.mode1_submits += 1;
+        }
+        if shape.mode == 2 {
+            self.mode2_submits += 1;
+        }
+        Ok(true)
+    }
+}
+
+impl Drop for WebexCursorProxy {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.composition.Commit();
+            if IsWindow(Some(self.hwnd)).as_bool() {
+                let _ = DestroyWindow(self.hwnd);
+            }
+            let _ = self.latency_device.SetMaximumFrameLatency(1);
+        }
+    }
+}
+
+unsafe extern "system" fn collect_z_order(hwnd: HWND, parameter: LPARAM) -> BOOL {
+    let windows = &mut *(parameter.0 as *mut Vec<HWND>);
+    windows.push(hwnd);
+    BOOL(1)
+}
+
+fn z_order_snapshot() -> windows::core::Result<Vec<HWND>> {
+    let mut windows = Vec::new();
+    unsafe {
+        EnumWindows(
+            Some(collect_z_order),
+            LPARAM(&mut windows as *mut _ as isize),
+        )?
+    };
+    Ok(windows)
+}
+
+fn overlay_ranks_are_above_owner(panel_ranks: &[usize], owner_rank: usize) -> bool {
+    panel_ranks.iter().all(|rank| *rank < owner_rank)
+        && panel_ranks.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn ensure_overlays_above_owner(owner: HWND, panels: &[HWND]) -> windows::core::Result<()> {
+    if panels.is_empty() {
+        return Ok(());
+    }
+    let mut owner_pid = 0u32;
+    let owner_thread = unsafe { GetWindowThreadProcessId(owner, Some(&mut owner_pid)) };
+    if owner_thread == 0 || owner_pid == 0 {
+        return Err(Error::from_win32());
+    }
+    let owner_topmost = unsafe { GetWindowLongPtrW(owner, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 };
+    for panel in panels {
+        if unsafe { GetWindow(*panel, GW_OWNER) }.ok() != Some(owner) {
+            return Err(Error::from_win32());
+        }
+        let mut panel_pid = 0u32;
+        let panel_thread = unsafe { GetWindowThreadProcessId(*panel, Some(&mut panel_pid)) };
+        let panel_topmost =
+            unsafe { GetWindowLongPtrW(*panel, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 };
+        if panel_thread != owner_thread || panel_pid != owner_pid || panel_topmost != owner_topmost
+        {
+            return Err(Error::from_win32());
+        }
+    }
+
+    let mut snapshot = z_order_snapshot()?;
+    let owner_rank = snapshot
+        .iter()
+        .position(|window| *window == owner)
+        .ok_or_else(Error::from_win32)?;
+    let mut panel_ranks = panels
+        .iter()
+        .map(|panel| {
+            snapshot
+                .iter()
+                .position(|window| window == panel)
+                .ok_or_else(Error::from_win32)
+        })
+        .collect::<windows::core::Result<Vec<_>>>()?;
+    let already_correct = overlay_ranks_are_above_owner(&panel_ranks, owner_rank);
+    if !already_correct {
+        for panel in panels {
+            unsafe {
+                SetWindowPos(
+                    *panel,
+                    Some(owner),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                )?;
+                SetWindowPos(
+                    owner,
+                    Some(*panel),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                )?;
+            }
+        }
+        snapshot = z_order_snapshot()?;
+        let final_owner_rank = snapshot
+            .iter()
+            .position(|window| *window == owner)
+            .ok_or_else(Error::from_win32)?;
+        panel_ranks = panels
+            .iter()
+            .map(|panel| {
+                snapshot
+                    .iter()
+                    .position(|window| window == panel)
+                    .ok_or_else(Error::from_win32)
+            })
+            .collect::<windows::core::Result<Vec<_>>>()?;
+        if !overlay_ranks_are_above_owner(&panel_ranks, final_owner_rank) {
+            return Err(Error::from_win32());
+        }
+    }
+    Ok(())
+}
+
+fn ensure_proxy_above_panels(
+    cursor: HWND,
+    overlays: &WebexOverlayManager,
+) -> windows::core::Result<()> {
+    let panels = overlays
+        .entries
+        .values()
+        .map(|entry| entry.window)
+        .collect::<Vec<_>>();
+    if panels.is_empty() {
+        return Ok(());
+    }
+    let cursor_topmost =
+        unsafe { GetWindowLongPtrW(cursor, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 };
+    if panels.iter().any(|panel| unsafe {
+        GetWindowLongPtrW(*panel, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0
+    } != cursor_topmost)
+    {
+        unsafe {
+            let _ = ShowWindow(cursor, SW_HIDE);
+        }
+        return Err(Error::from_win32());
+    }
+    let mut snapshot = z_order_snapshot()?;
+    let panel_above = panels
+        .iter()
+        .filter_map(|panel| snapshot.iter().position(|window| window == panel))
+        .min()
+        .ok_or_else(Error::from_win32)?;
+    let cursor_rank = snapshot
+        .iter()
+        .position(|window| *window == cursor)
+        .ok_or_else(Error::from_win32)?;
+    if cursor_rank >= panel_above {
+        let panel = snapshot[panel_above];
+        unsafe {
+            SetWindowPos(
+                cursor,
+                Some(panel),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )?;
+            SetWindowPos(
+                panel,
+                Some(cursor),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            )?;
+        }
+        snapshot = z_order_snapshot()?;
+    }
+    let cursor_rank = snapshot
+        .iter()
+        .position(|window| *window == cursor)
+        .ok_or_else(Error::from_win32)?;
+    let highest_panel_rank = panels
+        .iter()
+        .filter_map(|panel| snapshot.iter().position(|window| window == panel))
+        .min()
+        .ok_or_else(Error::from_win32)?;
+    if cursor_rank < highest_panel_rank {
+        Ok(())
+    } else {
+        unsafe {
+            let _ = ShowWindow(cursor, SW_HIDE);
+        }
+        Err(Error::from_win32())
+    }
+}
+
+unsafe extern "system" fn webex_overlay_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_ERASEBKGND => LRESULT(1),
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+unsafe extern "system" fn collect_webex_windows(hwnd: HWND, parameter: LPARAM) -> BOOL {
+    let scan = &mut *(parameter.0 as *mut WebexWindowScan);
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return BOOL(1);
+    }
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_err()
+        || rect.right - rect.left < 50
+        || rect.bottom - rect.top < 24
+    {
+        return BOOL(1);
+    }
+    if intersect_rect(rect, scan.monitor).is_none() {
+        return BOOL(1);
+    }
+    if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 == 0 {
+        return BOOL(1);
+    }
+    let mut affinity = 0u32;
+    if GetWindowDisplayAffinity(hwnd, &mut affinity).is_err() || affinity != 0x11 {
+        return BOOL(1);
+    }
+    let mut cloaked = 0u32;
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut _ as *mut c_void,
+        size_of::<u32>() as u32,
+    )
+    .is_err()
+        || cloaked != 0
+    {
+        return BOOL(1);
+    }
+
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 {
+        return BOOL(1);
+    }
+    let basename = if let Some(name) = scan.process_paths.get(&pid) {
+        name.as_str()
+    } else {
+        let Ok(name) = process_basename(pid) else {
+            return BOOL(1);
+        };
+        scan.process_paths.insert(pid, name);
+        scan.process_paths
+            .get(&pid)
+            .map(String::as_str)
+            .unwrap_or("")
+    };
+    if !basename.eq_ignore_ascii_case("CiscoCollabHost.exe")
+        && !basename.eq_ignore_ascii_case("WebexHost.exe")
+    {
+        return BOOL(1);
+    }
+    scan.windows.push(WebexWindow {
+        hwnd,
+        pid,
+        rect,
+        z_order: scan.windows.len(),
+    });
+    BOOL(1)
+}
+
+fn process_basename(pid: u32) -> windows::core::Result<String> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)? };
+    let result = (|| {
+        let mut buffer = vec![0u16; 32768];
+        let mut length = buffer.len() as u32;
+        unsafe {
+            QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_FORMAT(0),
+                PWSTR(buffer.as_mut_ptr()),
+                &mut length,
+            )?;
+        }
+        let path = std::ffi::OsString::from_wide(&buffer[..length as usize]);
+        let name = Path::new(&path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        Ok(ascii(&name))
+    })();
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    result
+}
+
+fn intersect_rect(a: RECT, b: RECT) -> Option<RECT> {
+    let rect = RECT {
+        left: a.left.max(b.left),
+        top: a.top.max(b.top),
+        right: a.right.min(b.right),
+        bottom: a.bottom.min(b.bottom),
+    };
+    (rect.left < rect.right && rect.top < rect.bottom).then_some(rect)
+}
+
+fn same_rect(a: RECT, b: RECT) -> bool {
+    a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+}
+
+fn webex_overlay_union_rect(overlays: &WebexOverlayManager) -> Option<RECT> {
+    union_rects(
+        overlays
+            .entries
+            .values()
+            .map(|entry| entry.destination_rect),
+    )
+}
+
+fn union_rects(rects: impl IntoIterator<Item = RECT>) -> Option<RECT> {
+    let mut rects = rects.into_iter();
+    let first = rects.next()?;
+    Some(rects.fold(first, |bounds, rect| RECT {
+        left: bounds.left.min(rect.left),
+        top: bounds.top.min(rect.top),
+        right: bounds.right.max(rect.right),
+        bottom: bounds.bottom.max(rect.bottom),
+    }))
+}
+
+impl WebexOverlayManager {
+    fn clear(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            unsafe {
+                let _ = DwmUnregisterThumbnail(entry.thumbnail);
+                if IsWindow(Some(entry.window)).as_bool() {
+                    let _ = DestroyWindow(entry.window);
+                }
+            }
+        }
+        self.last_z_order_check = None;
+        self.z_order_retry_after = None;
+    }
+
+    fn report_error(&mut self, error: String) {
+        if self.last_error.as_deref() != Some(error.as_str()) {
+            log(&format!("WARNING: Webex overlay: {error}"));
+            self.errors += 1;
+        }
+        self.last_error = Some(error);
+    }
+
+    fn register_class(&mut self) -> windows::core::Result<()> {
+        if self.class_registered {
+            return Ok(());
+        }
+        unsafe {
+            let instance = GetModuleHandleW(None)?;
+            let class = WNDCLASSW {
+                hInstance: instance.into(),
+                lpszClassName: w!("ExMonitorViewerWebexOverlay"),
+                lpfnWndProc: Some(webex_overlay_proc),
+                ..Default::default()
+            };
+            if RegisterClassW(&class) == 0 {
+                return Err(Error::from_win32());
+            }
+        }
+        self.class_registered = true;
+        Ok(())
+    }
+
+    fn sync(&mut self, owner: HWND, renderer: &Renderer) {
+        if !WEBEX_CONTROLS.load(Ordering::Relaxed)
+            || WINDOW_MINIMIZED.load(Ordering::Relaxed)
+            || WEBEX_OVERLAYS_SUSPENDED.load(Ordering::Relaxed)
+            || IN_SIZE_MOVE.load(Ordering::Relaxed)
+        {
+            self.clear();
+            self.last_view_rect = None;
+            self.geometry_changed_at = None;
+            return;
+        }
+        if self
+            .z_order_retry_after
+            .is_some_and(|retry_after| Instant::now() < retry_after)
+        {
+            for entry in self.entries.values() {
+                unsafe {
+                    let _ = ShowWindow(entry.window, SW_HIDE);
+                }
+            }
+            return;
+        }
+        self.z_order_retry_after = None;
+        let mut owner_cloaked = 0u32;
+        if !unsafe { IsWindowVisible(owner).as_bool() }
+            || unsafe { IsIconic(owner).as_bool() }
+            || unsafe {
+                DwmGetWindowAttribute(
+                    owner,
+                    DWMWA_CLOAKED,
+                    &mut owner_cloaked as *mut _ as *mut c_void,
+                    size_of::<u32>() as u32,
+                )
+            }
+            .is_err()
+            || owner_cloaked != 0
+        {
+            self.clear();
+            return;
+        }
+
+        let mut client = RECT::default();
+        if unsafe { GetClientRect(owner, &mut client) }.is_err() {
+            self.clear();
+            return;
+        }
+        let mut origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+        if !unsafe { ClientToScreen(owner, &mut origin) }.as_bool() {
+            self.clear();
+            return;
+        }
+        let view_rect = RECT {
+            left: origin.x,
+            top: origin.y,
+            right: origin.x + client.right,
+            bottom: origin.y + client.bottom,
+        };
+        if self
+            .last_view_rect
+            .is_none_or(|previous| !same_rect(previous, view_rect))
+        {
+            self.clear();
+            self.last_view_rect = Some(view_rect);
+            self.geometry_changed_at = Some(Instant::now());
+            return;
+        }
+        if self
+            .geometry_changed_at
+            .is_some_and(|changed| changed.elapsed() < Duration::from_millis(120))
+        {
+            self.clear();
+            return;
+        }
+
+        let monitor_rect = RECT {
+            left: renderer.monitor_left,
+            top: renderer.monitor_top,
+            right: renderer.monitor_left + renderer.monitor_width as i32,
+            bottom: renderer.monitor_top + renderer.monitor_height as i32,
+        };
+        let mut scan = WebexWindowScan {
+            monitor: monitor_rect,
+            windows: Vec::new(),
+            process_paths: HashMap::new(),
+        };
+        if let Err(error) = unsafe {
+            EnumWindows(
+                Some(collect_webex_windows),
+                LPARAM(&mut scan as *mut _ as isize),
+            )
+        } {
+            self.clear();
+            self.report_error(format!("EnumWindows:{:#010x}", error.code().0 as u32));
+            return;
+        }
+
+        let fit = renderer.fit_display_rect();
+        let logical_width = renderer.logical_source_size().0 as f32;
+        let logical_height = renderer.logical_source_size().1 as f32;
+        let mut desired = HashMap::new();
+        for source in scan.windows {
+            if let Some((screen_rect, source_rect)) = map_webex_rect(
+                source.rect,
+                monitor_rect,
+                (renderer.monitor_width, renderer.monitor_height),
+                (logical_width, logical_height),
+                fit,
+                view_rect,
+            ) {
+                desired.insert(
+                    (source.hwnd.0 as isize, source.pid),
+                    (source, screen_rect, source_rect),
+                );
+            }
+        }
+        if desired.len() > MAX_WEBEX_OVERLAYS {
+            let mut ranked = desired
+                .into_iter()
+                .collect::<Vec<((isize, u32), (WebexWindow, RECT, RECT))>>();
+            ranked.sort_by_key(|(_, (source, _, _))| {
+                -i64::from(source.rect.right - source.rect.left)
+                    * i64::from(source.rect.bottom - source.rect.top)
+            });
+            desired = ranked.into_iter().take(MAX_WEBEX_OVERLAYS).collect();
+        }
+        let mut display_order = desired
+            .iter()
+            .map(|(key, (source, _, _))| (*key, source.z_order))
+            .collect::<Vec<_>>();
+        display_order.sort_by_key(|(_, rank)| *rank);
+
+        let stale = self
+            .entries
+            .keys()
+            .filter(|key| !desired.contains_key(key))
+            .copied()
+            .collect::<Vec<_>>();
+        for key in stale {
+            self.remove(key);
+        }
+        let mut error_this_sync = false;
+        let mut z_order_dirty = false;
+        let mut failed_updates = Vec::new();
+        for (key, (source, screen_rect, source_rect)) in desired {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                if entry.z_order != source.z_order {
+                    entry.z_order = source.z_order;
+                    z_order_dirty = true;
+                }
+                if !same_rect(entry.destination_rect, screen_rect)
+                    || !same_rect(entry.source_rect, source_rect)
+                {
+                    let width = screen_rect.right - screen_rect.left;
+                    let height = screen_rect.bottom - screen_rect.top;
+                    let position = unsafe {
+                        SetWindowPos(
+                            entry.window,
+                            None,
+                            screen_rect.left,
+                            screen_rect.top,
+                            width,
+                            height,
+                            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+                        )
+                    };
+                    let props = thumbnail_properties(source_rect, width, height);
+                    if let Err(error) = position.and_then(|_| unsafe {
+                        DwmUpdateThumbnailProperties(entry.thumbnail, &props)
+                    }) {
+                        let message = format!(
+                            "DwmUpdateThumbnailProperties:{:#010x}",
+                            error.code().0 as u32
+                        );
+                        self.report_error(message);
+                        error_this_sync = true;
+                        failed_updates.push(key);
+                    } else {
+                        entry.destination_rect = screen_rect;
+                        entry.source_rect = source_rect;
+                        self.refreshes += 1;
+                    }
+                } else if !unsafe { IsWindowVisible(entry.window).as_bool() } {
+                    z_order_dirty = true;
+                }
+                continue;
+            }
+            match self.create_overlay(owner, source, screen_rect, source_rect) {
+                Ok(entry) => {
+                    self.entries.insert(key, entry);
+                    self.refreshes += 1;
+                    z_order_dirty = true;
+                }
+                Err(error) => {
+                    self.report_error(format!("overlay creation:{:#010x}", error.code().0 as u32));
+                    error_this_sync = true;
+                }
+            }
+        }
+        for key in failed_updates {
+            self.remove(key);
+            z_order_dirty = true;
+        }
+        let z_order_check_due = self
+            .last_z_order_check
+            .is_none_or(|last| last.elapsed() >= Duration::from_millis(150));
+        if z_order_dirty || z_order_check_due {
+            let panel_windows = display_order
+                .iter()
+                .filter_map(|(key, _)| self.entries.get(key))
+                .map(|entry| entry.window)
+                .collect::<Vec<_>>();
+            match ensure_overlays_above_owner(owner, &panel_windows) {
+                Ok(()) => {
+                    self.last_z_order_check = Some(Instant::now());
+                    for panel in panel_windows {
+                        if !unsafe { IsWindowVisible(panel).as_bool() } {
+                            unsafe {
+                                let _ = ShowWindow(panel, SW_SHOWNOACTIVATE);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    for panel in panel_windows {
+                        unsafe {
+                            let _ = ShowWindow(panel, SW_HIDE);
+                        }
+                    }
+                    self.z_order_retry_after = Some(Instant::now() + Duration::from_secs(1));
+                    self.report_error(format!("overlay z-order:{:#010x}", error.code().0 as u32));
+                    error_this_sync = true;
+                }
+            }
+        }
+        self.max_count = self.max_count.max(self.entries.len() as u32);
+        if !error_this_sync {
+            self.last_error = None;
+        }
+    }
+
+    fn create_overlay(
+        &mut self,
+        owner: HWND,
+        source: WebexWindow,
+        destination_rect: RECT,
+        source_rect: RECT,
+    ) -> windows::core::Result<WebexOverlay> {
+        self.register_class()?;
+        let width = destination_rect.right - destination_rect.left;
+        let height = destination_rect.bottom - destination_rect.top;
+        let overlay = unsafe {
+            let instance = GetModuleHandleW(None)?;
+            CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+                w!("ExMonitorViewerWebexOverlay"),
+                w!(""),
+                WS_POPUP,
+                destination_rect.left,
+                destination_rect.top,
+                width,
+                height,
+                Some(owner),
+                None,
+                Some(instance.into()),
+                None,
+            )?
+        };
+        unsafe {
+            let _ = ShowWindow(overlay, SW_SHOWNOACTIVATE);
+            let _ = UpdateWindow(overlay);
+        }
+        let configured = unsafe {
+            SetWindowDisplayAffinity(overlay, WDA_EXCLUDEFROMCAPTURE).and_then(|_| {
+                let mut affinity = 0u32;
+                GetWindowDisplayAffinity(overlay, &mut affinity)?;
+                if affinity == 0x11 {
+                    Ok(())
+                } else {
+                    Err(Error::from_win32())
+                }
+            })
+        };
+        if let Err(error) = configured {
+            unsafe {
+                let _ = DestroyWindow(overlay);
+            }
+            return Err(error);
+        }
+        let thumbnail = match unsafe { DwmRegisterThumbnail(overlay, source.hwnd) } {
+            Ok(value) => value,
+            Err(error) => {
+                unsafe {
+                    let _ = DestroyWindow(overlay);
+                }
+                return Err(error);
+            }
+        };
+        let props = thumbnail_properties(source_rect, width, height);
+        if let Err(error) = unsafe { DwmUpdateThumbnailProperties(thumbnail, &props) } {
+            unsafe {
+                let _ = DwmUnregisterThumbnail(thumbnail);
+                let _ = DestroyWindow(overlay);
+            }
+            return Err(error);
+        }
+        Ok(WebexOverlay {
+            thumbnail,
+            window: overlay,
+            source_rect,
+            destination_rect,
+            z_order: source.z_order,
+        })
+    }
+
+    fn remove(&mut self, key: (isize, u32)) {
+        if let Some(entry) = self.entries.remove(&key) {
+            unsafe {
+                let _ = DwmUnregisterThumbnail(entry.thumbnail);
+                if IsWindow(Some(entry.window)).as_bool() {
+                    let _ = DestroyWindow(entry.window);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for WebexOverlayManager {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+fn thumbnail_properties(source: RECT, width: i32, height: i32) -> DWM_THUMBNAIL_PROPERTIES {
+    DWM_THUMBNAIL_PROPERTIES {
+        dwFlags: DWM_TNP_RECTDESTINATION
+            | DWM_TNP_RECTSOURCE
+            | DWM_TNP_SOURCECLIENTAREAONLY
+            | DWM_TNP_VISIBLE,
+        rcDestination: RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        },
+        rcSource: source,
+        opacity: 255,
+        fVisible: true.into(),
+        fSourceClientAreaOnly: false.into(),
+    }
+}
+
+fn map_webex_rect(
+    source: RECT,
+    monitor: RECT,
+    monitor_size: (u32, u32),
+    logical_size: (f32, f32),
+    fit: crate::math::FitRect,
+    viewer_rect: RECT,
+) -> Option<(RECT, RECT)> {
+    let clipped = intersect_rect(source, monitor)?;
+    let scale_x = logical_size.0 / monitor_size.0.max(1) as f32;
+    let scale_y = logical_size.1 / monitor_size.1.max(1) as f32;
+    let to_view_x = |screen_x: i32| {
+        fit.x + (screen_x - monitor.left) as f32 * scale_x * fit.width / logical_size.0
+    };
+    let to_view_y = |screen_y: i32| {
+        fit.y + (screen_y - monitor.top) as f32 * scale_y * fit.height / logical_size.1
+    };
+    let left = viewer_rect.left + to_view_x(clipped.left).floor() as i32;
+    let top = viewer_rect.top + to_view_y(clipped.top).floor() as i32;
+    let right = viewer_rect.left + to_view_x(clipped.right).ceil() as i32;
+    let bottom = viewer_rect.top + to_view_y(clipped.bottom).ceil() as i32;
+    if right - left < 2 || bottom - top < 2 {
+        return None;
+    }
+    Some((
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        },
+        RECT {
+            left: clipped.left - source.left,
+            top: clipped.top - source.top,
+            right: clipped.right - source.left,
+            bottom: clipped.bottom - source.top,
+        },
+    ))
 }
 
 fn window_workarea_overlap(window: WindowSettings, display: &Display) -> i64 {
@@ -1058,6 +2650,10 @@ fn display_number(name: &str) -> u32 {
 struct Renderer {
     monitor_index: usize,
     monitor_name: String,
+    monitor_left: i32,
+    monitor_top: i32,
+    monitor_width: u32,
+    monitor_height: u32,
     source_width: u32,
     source_height: u32,
     device: ID3D11Device,
@@ -1070,6 +2666,8 @@ struct Renderer {
     target_view: Option<ID3D11RenderTargetView>,
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
+    cursor_proxy_vertex_shader: ID3D11VertexShader,
+    cursor_proxy_pixel_shader: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     cursor_texture: Option<ID3D11Texture2D>,
     cursor_view: Option<ID3D11ShaderResourceView>,
@@ -1077,6 +2675,13 @@ struct Renderer {
     cursor_shape: Option<DecodedShape>,
     cursor_position: [i32; 2],
     cursor_visible: bool,
+    proxy_cursor_view: Option<ID3D11ShaderResourceView>,
+    proxy_cursor_shape: Option<DecodedShape>,
+    proxy_cursor_handle: isize,
+    proxy_cursor_hotspot: [i32; 2],
+    proxy_cursor_screen_position: [i32; 2],
+    proxy_cursor_visible: bool,
+    proxy_cursor_retry_after: Option<Instant>,
     synthetic_cursor: bool,
     synthetic_started: Option<Instant>,
     synthetic_position_updated: bool,
@@ -1117,6 +2722,128 @@ impl Renderer {
         } else {
             (self.source_width, self.source_height)
         }
+    }
+
+    fn fit_display_rect(&self) -> crate::math::FitRect {
+        let (width, height) = self.logical_source_size();
+        crate::math::fit_rect(
+            width as f32,
+            height as f32,
+            self.window_width as f32,
+            self.window_height as f32,
+        )
+    }
+
+    fn active_cursor_shape(&self) -> Option<DecodedShape> {
+        if self.synthetic_cursor {
+            self.fixture_shape
+        } else {
+            self.cursor_shape
+        }
+    }
+
+    fn active_cursor_position(&self) -> [i32; 2] {
+        if self.synthetic_cursor {
+            self.fixture_position
+        } else {
+            self.cursor_position
+        }
+    }
+
+    fn active_cursor_view(&self) -> Option<ID3D11ShaderResourceView> {
+        if self.synthetic_cursor {
+            self.fixture_view.clone()
+        } else {
+            self.cursor_view.clone()
+        }
+    }
+
+    unsafe fn update_proxy_cursor(&mut self) {
+        let state = match unsafe { win32_cursor::query_cursor_state() } {
+            Ok(state) => state,
+            Err(_) => {
+                self.proxy_cursor_visible = false;
+                return;
+            }
+        };
+        self.proxy_cursor_screen_position = state.screen_position;
+        if !state.visible || state.handle == 0 {
+            self.proxy_cursor_visible = false;
+            return;
+        }
+        let now = Instant::now();
+        let handle_changed = state.handle != self.proxy_cursor_handle;
+        let retry_ready = self
+            .proxy_cursor_retry_after
+            .is_none_or(|retry_after| now >= retry_after);
+        if handle_changed || (self.proxy_cursor_shape.is_none() && retry_ready) {
+            if handle_changed {
+                self.proxy_cursor_shape = None;
+                self.proxy_cursor_view = None;
+            }
+            if !retry_ready && !handle_changed {
+                self.proxy_cursor_visible = false;
+                return;
+            }
+            self.proxy_cursor_handle = state.handle;
+            match unsafe { win32_cursor::decode_cursor(state.handle) } {
+                Ok(bitmap) => {
+                    if unsafe { self.upload_proxy_cursor_shape(bitmap.shape, &bitmap.pixels) }
+                        .is_err()
+                    {
+                        self.proxy_cursor_retry_after = Some(now + Duration::from_millis(500));
+                        self.proxy_cursor_visible = false;
+                        return;
+                    }
+                    self.proxy_cursor_shape = Some(bitmap.shape);
+                    self.proxy_cursor_hotspot = bitmap.hotspot;
+                    self.proxy_cursor_retry_after = None;
+                }
+                Err(_) => {
+                    self.proxy_cursor_retry_after = Some(now + Duration::from_millis(500));
+                    self.proxy_cursor_visible = false;
+                    return;
+                }
+            }
+        }
+        self.proxy_cursor_visible =
+            self.proxy_cursor_shape.is_some() && self.proxy_cursor_view.is_some();
+    }
+
+    unsafe fn upload_proxy_cursor_shape(
+        &mut self,
+        shape: DecodedShape,
+        pixels: &[u8],
+    ) -> windows::core::Result<()> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: shape.width,
+            Height: shape.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let data = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr() as *const c_void,
+            SysMemPitch: shape.width * 4,
+            SysMemSlicePitch: 0,
+        };
+        let mut texture = None;
+        self.device
+            .CreateTexture2D(&desc, Some(&data), Some(&mut texture))?;
+        let texture = texture.ok_or_else(Error::from_win32)?;
+        let mut view = None;
+        self.device
+            .CreateShaderResourceView(&texture, None, Some(&mut view))?;
+        self.proxy_cursor_view = Some(view.ok_or_else(Error::from_win32)?);
+        Ok(())
     }
 
     unsafe fn new(
@@ -1207,6 +2934,8 @@ impl Renderer {
         };
         let pixel_source = PIXEL_SHADER.replace("ROTATION_INDEX", &rotation.to_string());
         let (vertex_shader, pixel_shader) = make_shaders(&device, &pixel_source)?;
+        let (cursor_proxy_vertex_shader, cursor_proxy_pixel_shader) =
+            compile_cursor_proxy_shaders(&device)?;
         let cursor_buffer_desc = D3D11_BUFFER_DESC {
             ByteWidth: size_of::<CursorConstants>() as u32,
             Usage: D3D11_USAGE_DEFAULT,
@@ -1236,6 +2965,10 @@ impl Renderer {
         let mut renderer = Self {
             monitor_index: CURRENT_MONITOR.load(Ordering::Relaxed) as usize,
             monitor_name: display.name.clone(),
+            monitor_left: display.left,
+            monitor_top: display.top,
+            monitor_width: display.width,
+            monitor_height: display.height,
             source_width,
             source_height,
             device,
@@ -1248,6 +2981,8 @@ impl Renderer {
             target_view: Some(target_view),
             vertex_shader,
             pixel_shader,
+            cursor_proxy_vertex_shader,
+            cursor_proxy_pixel_shader,
             sampler,
             cursor_texture: None,
             cursor_view: None,
@@ -1255,6 +2990,13 @@ impl Renderer {
             cursor_shape: None,
             cursor_position: [0, 0],
             cursor_visible: false,
+            proxy_cursor_view: None,
+            proxy_cursor_shape: None,
+            proxy_cursor_handle: 0,
+            proxy_cursor_hotspot: [0, 0],
+            proxy_cursor_screen_position: [0, 0],
+            proxy_cursor_visible: false,
+            proxy_cursor_retry_after: None,
             synthetic_cursor,
             synthetic_started: synthetic_cursor.then(Instant::now),
             synthetic_position_updated: false,
@@ -1461,20 +3203,7 @@ impl Renderer {
     }
 
     unsafe fn render(&mut self) -> windows::core::Result<bool> {
-        let fitted = crate::math::fit_rect(
-            if self.rotated {
-                self.source_height as f32
-            } else {
-                self.source_width as f32
-            },
-            if self.rotated {
-                self.source_width as f32
-            } else {
-                self.source_height as f32
-            },
-            self.window_width as f32,
-            self.window_height as f32,
-        );
+        let fitted = self.fit_display_rect();
         let viewport = D3D11_VIEWPORT {
             TopLeftX: fitted.x,
             TopLeftY: fitted.y,
@@ -1709,6 +3438,77 @@ unsafe fn make_shaders(
     ))
 }
 
+unsafe fn compile_cursor_proxy_shaders(
+    device: &ID3D11Device,
+) -> windows::core::Result<(ID3D11VertexShader, ID3D11PixelShader)> {
+    make_shaders(device, CURSOR_PROXY_PIXEL_SHADER)
+}
+
+const CURSOR_PROXY_PIXEL_SHADER: &str = r#"
+Texture2D cursor_image : register(t0);
+cbuffer CursorProxyConstants : register(b0) {
+    float2 cursor_size;
+    float2 output_size;
+    uint cursor_mode;
+    uint clip_count;
+    uint diagnostic_tint;
+    uint reserved;
+    float2 padding;
+    float2 alignment;
+    float4 clips[32];
+};
+bool in_bounds(int2 p) {
+    return all(p >= 0) && all(p < int2(cursor_size));
+}
+bool invert_pixel(int2 p) {
+    if (!in_bounds(p)) return false;
+    float4 source = cursor_image.Load(int3(p, 0));
+    if (cursor_mode == 1) return source.r >= 0.5 && source.a >= 0.5;
+    return cursor_mode == 2 && source.a >= 0.5 && any(source.rgb > (0.5 / 255.0));
+}
+float4 fallback_pixel(int2 p) {
+    if (!in_bounds(p)) return float4(0, 0, 0, 0);
+    float4 source = cursor_image.Load(int3(p, 0));
+    if (cursor_mode == 0) {
+        float alpha = saturate(source.a);
+        return float4(source.rgb * alpha, alpha);
+    }
+    if (cursor_mode == 1) {
+        bool and_bit = source.r >= 0.5;
+        bool xor_bit = source.a >= 0.5;
+        if (!and_bit) return xor_bit ? float4(1, 1, 1, 1) : float4(0, 0, 0, 1);
+        if (!xor_bit) return float4(0, 0, 0, 0);
+    } else {
+        if (source.a < 0.5) return float4(source.rgb, 1.0);
+        if (all(source.rgb <= (0.5 / 255.0))) return float4(0, 0, 0, 0);
+    }
+    bool edge = false;
+    [unroll] for (int y = -1; y <= 1; ++y) {
+        [unroll] for (int x = -1; x <= 1; ++x) {
+            if (x == 0 && y == 0) continue;
+            if (invert_pixel(p + int2(x, y)) != invert_pixel(p)) edge = true;
+        }
+    }
+    return edge ? float4(0, 0, 0, 1) : float4(1, 1, 1, 1);
+}
+float4 ps_main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float2 pixel = position.xy;
+    bool inside = false;
+    [loop] for (uint i = 0; i < clip_count; ++i) {
+        if (all(pixel >= clips[i].xy) && all(pixel < clips[i].zw)) { inside = true; break; }
+    }
+    if (!inside) return float4(0, 0, 0, 0);
+    float2 shape_pixel = (pixel - padding) * cursor_size / output_size - 0.5;
+    int2 base = int2(floor(shape_pixel));
+    float2 weight = frac(shape_pixel);
+    float4 top = lerp(fallback_pixel(base), fallback_pixel(base + int2(1, 0)), weight.x);
+    float4 bottom = lerp(fallback_pixel(base + int2(0, 1)), fallback_pixel(base + int2(1, 1)), weight.x);
+    float4 result = lerp(top, bottom, weight.y);
+    if (diagnostic_tint != 0) return float4(result.a, 0.0, result.a, result.a);
+    return result;
+}
+"#;
+
 const VERTEX_SHADER: &str = r#"
 struct Out { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
 Out vs_main(uint id : SV_VertexID) {
@@ -1860,6 +3660,7 @@ unsafe extern "system" fn window_proc(
                 }
                 MONITOR_MENU_BASE..=2000 => {
                     CURRENT_MONITOR.store((id - MONITOR_MENU_BASE) as u32, Ordering::Relaxed);
+                    invalidate_webex_state();
                     SETTINGS_DIRTY.store(true, Ordering::Relaxed);
                     let menu = HMENU(MONITOR_MENU_HANDLE.load(Ordering::Relaxed) as *mut c_void);
                     let count = GetMenuItemCount(Some(menu)).max(1) as usize;
@@ -1877,6 +3678,7 @@ unsafe extern "system" fn window_proc(
                 TOPMOST_MENU => {
                     let enabled = !TOPMOST.load(Ordering::Relaxed);
                     TOPMOST.store(enabled, Ordering::Relaxed);
+                    invalidate_webex_state();
                     SETTINGS_DIRTY.store(true, Ordering::Relaxed);
                     let _ = SetWindowPos(
                         hwnd,
@@ -1897,6 +3699,38 @@ unsafe extern "system" fn window_proc(
                         TOPMOST_MENU as u32,
                         (MF_BYCOMMAND | if enabled { MF_CHECKED } else { MF_UNCHECKED }).0,
                     );
+                }
+                WEBEX_CONTROLS_MENU => {
+                    let enabled = !WEBEX_CONTROLS.load(Ordering::Relaxed);
+                    WEBEX_CONTROLS.store(enabled, Ordering::Relaxed);
+                    WEBEX_MENU_TOGGLE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    hide_owned_webex_overlays(hwnd);
+                    invalidate_webex_state();
+                    SETTINGS_DIRTY.store(true, Ordering::Relaxed);
+                    let _ = EndMenu();
+                    unsafe { post_webex_menu_recheck(hwnd, true) };
+                    let menu = GetMenu(hwnd);
+                    let label = webex_controls_menu_label(enabled);
+                    let _ = ModifyMenuW(
+                        menu,
+                        WEBEX_CONTROLS_MENU as u32,
+                        MF_BYCOMMAND | MF_STRING,
+                        WEBEX_CONTROLS_MENU,
+                        PCWSTR(label.as_ptr()),
+                    );
+                    let _ = CheckMenuItem(
+                        menu,
+                        WEBEX_CONTROLS_MENU as u32,
+                        (MF_BYCOMMAND | if enabled { MF_CHECKED } else { MF_UNCHECKED }).0,
+                    );
+                    let _ = DrawMenuBar(hwnd);
+                    log(if enabled {
+                        "Webex local controls enabled"
+                    } else {
+                        "Webex local controls disabled"
+                    });
+                    let _ = unsafe { snapshot_webex_gui_flags() };
+                    log_webex_ui_state("toggle");
                 }
                 _ => {}
             }
@@ -1931,9 +3765,56 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_ENTERSIZEMOVE => {
+            IN_SIZE_MOVE.store(true, Ordering::Relaxed);
+            WEBEX_OVERLAYS_SUSPENDED.store(true, Ordering::Relaxed);
+            hide_owned_webex_overlays(hwnd);
             LAST_SIZE_MODE.store(0, Ordering::Relaxed);
             ACTUAL_SCALE.store(0, Ordering::Relaxed);
             DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        WM_EXITSIZEMOVE => {
+            IN_SIZE_MOVE.store(false, Ordering::Relaxed);
+            WEBEX_OVERLAYS_SUSPENDED.store(false, Ordering::Relaxed);
+            invalidate_webex_state();
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        WM_ENTERMENULOOP => {
+            WEBEX_MENU_ENTER_COUNT.fetch_add(1, Ordering::Relaxed);
+            WEBEX_OVERLAYS_SUSPENDED.store(true, Ordering::Relaxed);
+            hide_owned_webex_overlays(hwnd);
+            let result = DefWindowProcW(hwnd, message, wparam, lparam);
+            let _ = unsafe { snapshot_webex_gui_flags() };
+            log_webex_ui_state("menu_enter");
+            result
+        }
+        WM_EXITMENULOOP => {
+            WEBEX_MENU_EXIT_COUNT.fetch_add(1, Ordering::Relaxed);
+            WEBEX_OVERLAYS_SUSPENDED.store(false, Ordering::Relaxed);
+            invalidate_webex_state();
+            let result = DefWindowProcW(hwnd, message, wparam, lparam);
+            let _ = unsafe { snapshot_webex_gui_flags() };
+            log_webex_ui_state("menu_exit");
+            result
+        }
+        WM_APP_WEBEX_MENU_RECHECK => {
+            let Some(gui_flags) = (unsafe { snapshot_webex_gui_flags() }) else {
+                log_webex_ui_state("menu_recheck_flags_unavailable");
+                return LRESULT(0);
+            };
+            let in_menu_mode = gui_flags & GUI_INMENUMODE.0 != 0;
+            if in_menu_mode {
+                if WEBEX_MENU_RECHECK_ATTEMPTS.fetch_add(1, Ordering::Relaxed) == 0 {
+                    let _ = EndMenu();
+                    unsafe { post_webex_menu_recheck(hwnd, false) };
+                }
+            } else {
+                WEBEX_MENU_RECHECK_ATTEMPTS.store(0, Ordering::Relaxed);
+                if WEBEX_OVERLAYS_SUSPENDED.swap(false, Ordering::Relaxed) {
+                    invalidate_webex_state();
+                }
+            }
+            log_webex_ui_state("menu_recheck");
+            LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
             DISPLAY_CHANGED.store(true, Ordering::Relaxed);
@@ -2274,6 +4155,237 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
 mod cursor_shader_tests {
     use super::*;
 
+    #[test]
+    fn overlay_z_order_requires_panels_above_owner_in_source_order() {
+        assert!(overlay_ranks_are_above_owner(&[1, 2], 3));
+        assert!(!overlay_ranks_are_above_owner(&[2], 1));
+        assert!(!overlay_ranks_are_above_owner(&[2, 1], 3));
+    }
+
+    #[test]
+    fn maps_webex_monitor_intersection_into_fit_viewport_and_source_window() {
+        let monitor = RECT {
+            left: 100,
+            top: 200,
+            right: 2020,
+            bottom: 1280,
+        };
+        let source = RECT {
+            left: 110,
+            top: 210,
+            right: 210,
+            bottom: 310,
+        };
+        let viewer = RECT {
+            left: 50,
+            top: 60,
+            right: 1010,
+            bottom: 600,
+        };
+        let (destination, source_crop) = map_webex_rect(
+            source,
+            monitor,
+            (1920, 1080),
+            (1920.0, 1080.0),
+            crate::math::FitRect {
+                x: 0.0,
+                y: 0.0,
+                width: 960.0,
+                height: 540.0,
+            },
+            viewer,
+        )
+        .unwrap();
+        assert_eq!(destination.left, 55);
+        assert_eq!(destination.top, 65);
+        assert_eq!(destination.right, 105);
+        assert_eq!(destination.bottom, 115);
+        assert_eq!(source_crop.left, 0);
+        assert_eq!(source_crop.top, 0);
+        assert_eq!(source_crop.right, 100);
+        assert_eq!(source_crop.bottom, 100);
+    }
+
+    #[test]
+    fn clips_webex_source_to_selected_monitor_without_rescaling_to_full_panel() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let source = RECT {
+            left: -20,
+            top: 100,
+            right: 40,
+            bottom: 160,
+        };
+        let viewer = RECT {
+            left: 10,
+            top: 20,
+            right: 970,
+            bottom: 560,
+        };
+        let (destination, source_crop) = map_webex_rect(
+            source,
+            monitor,
+            (1920, 1080),
+            (1920.0, 1080.0),
+            crate::math::FitRect {
+                x: 0.0,
+                y: 0.0,
+                width: 960.0,
+                height: 540.0,
+            },
+            viewer,
+        )
+        .unwrap();
+        assert_eq!((destination.left, destination.right), (10, 30));
+        assert_eq!((source_crop.left, source_crop.right), (20, 60));
+    }
+
+    #[test]
+    fn cursor_host_bounds_are_union_of_visible_panel_rectangles() {
+        let bounds = union_rects([
+            RECT {
+                left: 100,
+                top: 200,
+                right: 300,
+                bottom: 240,
+            },
+            RECT {
+                left: 500,
+                top: 150,
+                right: 560,
+                bottom: 400,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            (bounds.left, bounds.top, bounds.right, bounds.bottom),
+            (100, 150, 560, 400)
+        );
+        assert!(union_rects([]).is_none());
+    }
+
+    #[test]
+    fn proxy_color_is_premultiplied_and_clipped_to_panel_union() {
+        let cursor = [255, 0, 0, 255, 0, 0, 0, 0];
+        let (width, _, pixels) = unsafe {
+            render_proxy_test(
+                DecodedShape {
+                    width: 2,
+                    height: 1,
+                    mode: 0,
+                },
+                &cursor,
+                (4, 1),
+            )
+        };
+        let blended = pixels[2 * width as usize + 3];
+        assert!(
+            (188..=194).contains(&blended[0]),
+            "unexpected pixel: {blended:?}"
+        );
+        assert_eq!(blended[1], 0);
+        assert!(
+            (188..=194).contains(&blended[3]),
+            "unexpected pixel: {blended:?}"
+        );
+        assert_eq!(pixels[2 * width as usize + 1][3], 0);
+    }
+
+    #[test]
+    fn proxy_invert_fallback_is_visible_and_keeps_shape_boundary() {
+        let cursor = vec![255; 3 * 3 * 4];
+        let (width, _, pixels) = unsafe {
+            render_proxy_test(
+                DecodedShape {
+                    width: 3,
+                    height: 3,
+                    mode: 1,
+                },
+                &cursor,
+                (3, 3),
+            )
+        };
+        assert_eq!(pixels[3 * width as usize + 3], [255, 255, 255, 255]);
+        assert_eq!(pixels[2 * width as usize + 2], [0, 0, 0, 255]);
+        assert_eq!(pixels[3 * width as usize + 1][3], 0);
+    }
+
+    #[test]
+    fn proxy_monochrome_keeps_black_white_and_transparent_mask_pixels() {
+        let cursor = [
+            0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 0, 255, 255, 255, 255,
+        ];
+        let (width, _, pixels) = unsafe {
+            render_proxy_test(
+                DecodedShape {
+                    width: 2,
+                    height: 2,
+                    mode: 1,
+                },
+                &cursor,
+                (2, 2),
+            )
+        };
+        assert_eq!(pixels[2 * width as usize + 2], [0, 0, 0, 255]);
+        assert_eq!(pixels[2 * width as usize + 3], [255, 255, 255, 255]);
+        assert_eq!(pixels[3 * width as usize + 2][3], 0);
+    }
+
+    #[test]
+    fn proxy_masked_color_preserves_noninvert_color_pixels() {
+        let cursor = [80, 140, 220, 0].repeat(4);
+        let (width, _, pixels) = unsafe {
+            render_proxy_test(
+                DecodedShape {
+                    width: 2,
+                    height: 2,
+                    mode: 2,
+                },
+                &cursor,
+                (2, 2),
+            )
+        };
+        assert_eq!(pixels[2 * width as usize + 2], [80, 140, 220, 255]);
+    }
+
+    #[test]
+    fn proxy_masked_xor_zero_pixels_remain_transparent() {
+        let cursor = [0, 0, 0, 255].repeat(4);
+        let (_, _, pixels) = unsafe {
+            render_proxy_test(
+                DecodedShape {
+                    width: 2,
+                    height: 2,
+                    mode: 2,
+                },
+                &cursor,
+                (2, 2),
+            )
+        };
+        assert_eq!(pixels[2 * 6 + 2][3], 0);
+    }
+
+    #[test]
+    fn proxy_masked_low_nonzero_xor_is_not_treated_as_transparent() {
+        let cursor = [1, 0, 0, 255].repeat(4);
+        let (width, _, pixels) = unsafe {
+            render_proxy_test(
+                DecodedShape {
+                    width: 2,
+                    height: 2,
+                    mode: 2,
+                },
+                &cursor,
+                (2, 2),
+            )
+        };
+        assert_eq!(pixels[2 * width as usize + 2], [0, 0, 0, 255]);
+    }
+
     struct ShaderTestDevice {
         device: ID3D11Device,
         context: ID3D11DeviceContext,
@@ -2499,6 +4611,141 @@ mod cursor_shader_tests {
         pixels
     }
 
+    unsafe fn render_proxy_test(
+        shape: DecodedShape,
+        cursor: &[u8],
+        output_size: (u32, u32),
+    ) -> (u32, u32, Vec<[u8; 4]>) {
+        let output_width = output_size.0;
+        let output_height = output_size.1;
+        let width = output_width + 4;
+        let height = output_height + 4;
+        let test = make_test_device(0);
+        let proxy_pixel = compile_shader(
+            CURSOR_PROXY_PIXEL_SHADER,
+            PCSTR(c"ps_main".as_ptr() as *const u8),
+            PCSTR(c"ps_4_0".as_ptr() as *const u8),
+        )
+        .unwrap();
+        let mut proxy_pixel_shader = None;
+        test.device
+            .CreatePixelShader(
+                std::slice::from_raw_parts(
+                    proxy_pixel.GetBufferPointer() as *const u8,
+                    proxy_pixel.GetBufferSize(),
+                ),
+                None,
+                Some(&mut proxy_pixel_shader),
+            )
+            .unwrap();
+        let cursor_texture = make_test_texture(
+            &test.device,
+            shape.width,
+            shape.height,
+            cursor,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            D3D11_USAGE_IMMUTABLE,
+            0,
+        );
+        let target_texture = make_test_texture(
+            &test.device,
+            width,
+            height,
+            &[],
+            D3D11_BIND_RENDER_TARGET.0 as u32,
+            D3D11_USAGE_DEFAULT,
+            0,
+        );
+        let mut cursor_view = None;
+        test.device
+            .CreateShaderResourceView(&cursor_texture, None, Some(&mut cursor_view))
+            .unwrap();
+        let mut target_view = None;
+        test.device
+            .CreateRenderTargetView(&target_texture, None, Some(&mut target_view))
+            .unwrap();
+        let mut constants = CursorProxyConstants {
+            cursor_size: [shape.width as f32, shape.height as f32],
+            output_size: [output_width as f32, output_height as f32],
+            mode: shape.mode,
+            clip_count: 1,
+            diagnostic_tint: 0,
+            reserved: 0,
+            padding: [2.0, 2.0],
+            alignment: [0.0; 2],
+            clips: [[0.0; 4]; CURSOR_PROXY_CLIP_CAPACITY],
+        };
+        constants.clips[0] = [
+            2.0,
+            2.0,
+            (output_width + 2) as f32,
+            (output_height + 2) as f32,
+        ];
+        let desc = D3D11_BUFFER_DESC {
+            ByteWidth: size_of::<CursorProxyConstants>() as u32,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+            StructureByteStride: 0,
+        };
+        let initial = D3D11_SUBRESOURCE_DATA {
+            pSysMem: &constants as *const CursorProxyConstants as *const c_void,
+            SysMemPitch: 0,
+            SysMemSlicePitch: 0,
+        };
+        let mut constant_buffer = None;
+        test.device
+            .CreateBuffer(&desc, Some(&initial), Some(&mut constant_buffer))
+            .unwrap();
+        let target_view = target_view.unwrap();
+        test.context
+            .OMSetRenderTargets(Some(&[Some(target_view.clone())]), None);
+        test.context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]));
+        test.context.ClearRenderTargetView(&target_view, &[0.0; 4]);
+        test.context
+            .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        test.context.VSSetShader(&test.vertex_shader, None);
+        test.context.PSSetShader(&proxy_pixel_shader.unwrap(), None);
+        test.context.PSSetShaderResources(0, Some(&[cursor_view]));
+        test.context
+            .PSSetConstantBuffers(0, Some(&[constant_buffer]));
+        test.context.Draw(3, 0);
+        test.context.PSSetShaderResources(0, Some(&[None]));
+        test.context
+            .OMSetRenderTargets(None, None::<&ID3D11DepthStencilView>);
+        let readback = make_test_texture(
+            &test.device,
+            width,
+            height,
+            &[],
+            0,
+            D3D11_USAGE_STAGING,
+            D3D11_CPU_ACCESS_READ.0 as u32,
+        );
+        test.context.CopyResource(&readback, &target_texture);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        test.context
+            .Map(&readback, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .unwrap();
+        let mut pixels = Vec::with_capacity((width * height) as usize);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let source = (mapped.pData as *const u8).add(y * mapped.RowPitch as usize + x * 4);
+                pixels.push([*source, *source.add(1), *source.add(2), *source.add(3)]);
+            }
+        }
+        test.context.Unmap(&readback, 0);
+        (width, height, pixels)
+    }
+
     #[test]
     fn benchmark_cursor_requires_benchmark_duration() {
         let lone_fixture = vec![
@@ -2515,6 +4762,39 @@ mod cursor_shader_tests {
         let options = parse_options(&benchmark, 1).unwrap();
         assert!(options.benchmark_cursor);
         assert_eq!(options.benchmark_seconds, Some(20));
+    }
+
+    #[test]
+    fn webex_cursor_benchmark_requires_panel_capture_and_can_use_system_cursor() {
+        let invalid = vec![
+            "exmonitor-viewer".to_owned(),
+            "--benchmark".to_owned(),
+            "20".to_owned(),
+            "--benchmark-webex-cursor".to_owned(),
+        ];
+        assert!(parse_options(&invalid, 1).is_err());
+        let system_cursor = vec![
+            "exmonitor-viewer".to_owned(),
+            "--benchmark".to_owned(),
+            "20".to_owned(),
+            "--webex-controls".to_owned(),
+            "--benchmark-webex-cursor".to_owned(),
+        ];
+        let options = parse_options(&system_cursor, 1).unwrap();
+        assert!(options.benchmark_webex_cursor);
+        assert!(!options.benchmark_cursor);
+        assert_eq!(options.webex_controls, Some(true));
+        let valid = vec![
+            "exmonitor-viewer".to_owned(),
+            "--benchmark".to_owned(),
+            "20".to_owned(),
+            "--benchmark-cursor".to_owned(),
+            "--webex-controls".to_owned(),
+            "--benchmark-webex-cursor".to_owned(),
+        ];
+        let options = parse_options(&valid, 1).unwrap();
+        assert!(options.benchmark_webex_cursor);
+        assert_eq!(options.webex_controls, Some(true));
     }
 
     #[test]
@@ -2541,6 +4821,24 @@ mod cursor_shader_tests {
         assert_eq!(options.fps, Some(30));
         assert_eq!(options.size, Some((800, 450)));
         assert_eq!(options.benchmark_seconds, Some(5));
+    }
+
+    #[test]
+    fn webex_controls_cli_flags_explicitly_enable_or_disable_the_overlay() {
+        let enable = vec!["exmonitor-viewer".to_owned(), "--webex-controls".to_owned()];
+        assert_eq!(
+            parse_options(&enable, 1).unwrap().webex_controls,
+            Some(true)
+        );
+        let disable = vec![
+            "exmonitor-viewer".to_owned(),
+            "--webex-controls".to_owned(),
+            "--no-webex-controls".to_owned(),
+        ];
+        assert_eq!(
+            parse_options(&disable, 1).unwrap().webex_controls,
+            Some(false)
+        );
     }
 
     #[test]
